@@ -1,8 +1,8 @@
 {
     "name" : "悟",
     "appid" : "__UNI__A20E975",
-    "versionName" : "1.0.3",
-    "versionCode" : "103",
+    "versionName" : "1.0.4",
+    "versionCode" : "104",
     "app-plus" : {
         "modules" : {
             "Camera" : {},
