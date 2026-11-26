@@ -59,9 +59,9 @@
                 @confirm="submit"
               />
             </view>
-            <view class="captcha-img" role="button" aria-label="刷新验证码" @click="loadCaptcha">
+            <view class="captcha-img" role="button" aria-label="刷新验证码" :aria-busy="captchaLoading" @click="loadCaptcha">
               <image v-if="captcha.img" class="captcha-image" :src="captcha.img" mode="aspectFit" />
-              <text v-else class="captcha-loading">点击刷新</text>
+              <text v-else class="captcha-loading">{{ captchaLoading ? '加载中…' : '点击刷新' }}</text>
             </view>
           </view>
         </view>
@@ -84,8 +84,8 @@
           <text v-if="!captcha.turnstileSiteKey" class="form-error">人机校验尚未配置，请联系管理员</text>
         </view>
 
-        <text v-if="errorText" class="form-error" role="status">{{ errorText }}</text>
-        <button class="btn login-btn" :disabled="submitting" @click="submit">
+        <text v-if="errorText || captchaError" class="form-error" role="status">{{ errorText || captchaError }}</text>
+        <button class="btn login-btn" :disabled="submitting || captchaLoading || !captchaReady" @click="submit">
           {{ submitting ? '登录中…' : '登录' }}
         </button>
         <text class="login-foot">书架、感悟与备注按账号隔离，换设备登录同一账号即可继续</text>
@@ -96,6 +96,7 @@
 
 <script setup lang="ts">
 import { computed, reactive, ref } from 'vue'
+import { onLoad } from '@dcloudio/uni-app'
 // #ifdef H5
 import { onMounted, onUnmounted } from 'vue'
 // #endif
@@ -118,7 +119,7 @@ const themeClass = computed(() => (theme.theme === 'dark' ? 'theme-dark' : ''))
 
 const form = reactive({ username: '', password: '', code: '' })
 const captcha = reactive({
-  captchaEnabled: false,
+  captchaEnabled: true,
   uuid: '',
   img: '',
   turnstileEnabled: false,
@@ -127,6 +128,9 @@ const captcha = reactive({
 
 const submitting = ref(false)
 const errorText = ref('')
+const captchaLoading = ref(false)
+const captchaReady = ref(false)
+const captchaError = ref('')
 const challengeToken = ref('')
 const challengeExpiresAt = ref(0)
 const challengeRevision = ref(0)
@@ -186,28 +190,40 @@ function openChallenge() {
 }
 // #endif
 
-/** 加载图形验证码；开关以服务端返回为准，缺失时不显示验证码。 */
+/** 进入登录页及点击图片时获取验证码；由后端明确关闭时隐藏。 */
 async function loadCaptcha() {
+  if (captchaLoading.value) return
+  captchaLoading.value = true
+  captchaReady.value = false
+  captchaError.value = ''
+  form.code = ''
+  captcha.uuid = ''
+  captcha.img = ''
   try {
     const body = await request<CaptchaResult & { data?: CaptchaResult }>('/captchaImage')
-    const payload = (body as { data?: CaptchaResult }).data ?? body
-    captcha.captchaEnabled = payload.captchaEnabled === true
+    const payload = body?.data ?? body
+    if (!payload || typeof payload !== 'object') throw new Error('验证码响应无效')
+    captcha.captchaEnabled = payload.captchaEnabled !== false
     captcha.uuid = payload.uuid || ''
     captcha.img = payload.img ? 'data:image/' + (payload.imgType || 'gif') + ';base64,' + payload.img : ''
+    if (captcha.captchaEnabled && (!captcha.uuid || !captcha.img)) throw new Error('验证码响应不完整')
     captcha.turnstileEnabled = payload.turnstileEnabled === true
     const siteKey = captcha.turnstileEnabled ? payload.turnstileSiteKey || '' : ''
     if (siteKey !== captcha.turnstileSiteKey) {
       resetChallenge()
       captcha.turnstileSiteKey = siteKey
     }
-  } catch (failure) {
-    errorText.value = failure instanceof Error ? failure.message : '验证码加载失败，点击图片重试'
+    captchaReady.value = true
+  } catch {
+    captchaError.value = '验证码加载失败，点击图片重试'
+  } finally {
+    captchaLoading.value = false
   }
 }
 
 /** 提交登录：成功后写入账号会话并进入书架。 */
 async function submit() {
-  if (submitting.value) return
+  if (submitting.value || !captchaReady.value || captchaLoading.value) return
   errorText.value = ''
   if (!form.username.trim()) { errorText.value = '请输入账号'; return }
   if (!form.password) { errorText.value = '请输入密码'; return }
@@ -244,7 +260,7 @@ async function submit() {
   }
 }
 
-/** 先拿到 token 再请求 getInfo，因此这里临时写入后再补账号。 */
+onLoad(() => { void loadCaptcha() })
 </script>
 
 <style lang="scss" scoped>
