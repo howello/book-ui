@@ -6,7 +6,7 @@
           <image class="brand-icon" src="/static/icons/app/192x192.png" mode="aspectFit" aria-label="悟" />
         </view>
         <text class="login-title">悟</text>
-        <text class="login-subtitle">把读过的书，放回自己的书架</text>
+        <text class="login-subtitle">把读过的书，放回书架</text>
       </view>
 
       <view class="login-card">
@@ -88,7 +88,7 @@
         <button class="btn login-btn" :disabled="submitting || captchaLoading || !captchaReady" @click="submit">
           {{ submitting ? '登录中…' : '登录' }}
         </button>
-        <text class="login-foot">书架、感悟与备注按账号隔离，换设备登录同一账号即可继续</text>
+        <text class="login-foot">所有登录用户共用书架、感悟与备注</text>
       </view>
     </view>
   </view>
