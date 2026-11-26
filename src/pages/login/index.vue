@@ -84,6 +84,14 @@
           <text v-if="!captcha.turnstileSiteKey" class="form-error">人机校验尚未配置，请联系管理员</text>
         </view>
 
+        <checkbox-group @change="changeRememberPassword">
+          <label class="remember-label">
+            <checkbox value="remember" :checked="rememberPassword" :disabled="submitting"
+              :color="theme.theme === 'dark' ? '#c49a66' : '#8e6438'" aria-label="记住密码" />
+            <text>记住密码</text>
+          </label>
+        </checkbox-group>
+
         <text v-if="errorText || captchaError" class="form-error" role="status">{{ errorText || captchaError }}</text>
         <button class="btn login-btn" :disabled="submitting || captchaLoading || !captchaReady" @click="submit">
           {{ submitting ? '登录中…' : '登录' }}
@@ -101,8 +109,11 @@ import { onLoad } from '@dcloudio/uni-app'
 import { onMounted, onUnmounted } from 'vue'
 // #endif
 import AppIcon from '../../components/AppIcon.vue'
+import { bookStoragePrefix } from '../../api-env'
 import { ROUTES } from '../../shared/navigation'
-import { ApiError, request, setSession, useTheme } from '../../shared/store'
+import { ApiError, clearSession, refreshAccountProfile, request, setSession, useBookStore, useTheme } from '../../shared/store'
+
+const store = useBookStore()
 
 /** 验证码接口返回。字段与后台一致：平铺在响应顶层。 */
 interface CaptchaResult {
@@ -117,7 +128,14 @@ interface CaptchaResult {
 const theme = useTheme()
 const themeClass = computed(() => (theme.theme === 'dark' ? 'theme-dark' : ''))
 
-const form = reactive({ username: '', password: '', code: '' })
+const rememberKey = `${bookStoragePrefix}-login-remember`
+const storedLogin = uni.getStorageSync(rememberKey)
+const rememberPassword = ref(storedLogin !== false)
+const form = reactive({
+  username: typeof storedLogin?.username === 'string' ? storedLogin.username : '',
+  password: typeof storedLogin?.password === 'string' ? storedLogin.password : '',
+  code: ''
+})
 const captcha = reactive({
   captchaEnabled: true,
   uuid: '',
@@ -221,20 +239,28 @@ async function loadCaptcha() {
   }
 }
 
+/** 保存记住密码的开关，取消时立即清除上次登录的凭据。 */
+function changeRememberPassword(event: { detail: { value: string[] } }) {
+  rememberPassword.value = event.detail.value.includes('remember')
+  uni.setStorageSync(rememberKey, rememberPassword.value)
+}
+
 /** 提交登录：成功后写入账号会话并进入书架。 */
 async function submit() {
   if (submitting.value || !captchaReady.value || captchaLoading.value) return
   errorText.value = ''
-  if (!form.username.trim()) { errorText.value = '请输入账号'; return }
-  if (!form.password) { errorText.value = '请输入密码'; return }
+  const username = form.username.trim()
+  const password = form.password
+  if (!username) { errorText.value = '请输入账号'; return }
+  if (!password) { errorText.value = '请输入密码'; return }
   if (captcha.captchaEnabled && !form.code.trim()) { errorText.value = '请输入验证码'; return }
   if (captcha.turnstileEnabled && !hasChallengeToken()) { errorText.value = '请完成人机校验'; return }
 
   submitting.value = true
   try {
     const result = await request<{ token?: string }>('/login', 'POST', {
-      username: form.username.trim(),
-      password: form.password,
+      username,
+      password,
       code: form.code.trim(),
       uuid: captcha.uuid,
       client: 'book',
@@ -243,12 +269,17 @@ async function submit() {
     if (!result?.token) { errorText.value = '登录响应缺少凭证，请联系管理员'; return }
     // 先落 token，/getInfo 才带得上 Authorization
     setSession(result.token, '')
-    const info = await request<{ user?: { userId?: number; userName?: string } }>('/getInfo')
-    const userId = String(info?.user?.userId || '')
-    if (!userId) { errorText.value = '无法读取账号信息，请重试'; return }
-    setSession(result.token, userId)
+    await refreshAccountProfile()
+    if (rememberPassword.value) {
+      try {
+        uni.setStorageSync(rememberKey, { username, password })
+      } catch {
+        // 无法写入本机存储时仍可正常进入书架。
+      }
+    }
     uni.reLaunch({ url: ROUTES.home })
   } catch (failure) {
+    if (store.token.value && !store.account.value) clearSession()
     errorText.value = failure instanceof ApiError || failure instanceof Error ? failure.message : '登录失败'
     if (captcha.captchaEnabled) {
       form.code = ''
@@ -408,6 +439,17 @@ onLoad(() => { void loadCaptcha() })
 
 .captcha-image { width: 100%; height: 100%; }
 .captcha-loading { font-size: 10.5px; color: var(--ink-400); }
+
+.remember-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: fit-content;
+  min-height: 32px;
+  color: var(--ink-700);
+  font-size: 13px;
+  cursor: pointer;
+}
 
 .form-error {
   font-size: 12px;

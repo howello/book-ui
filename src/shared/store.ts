@@ -58,9 +58,21 @@ export interface ShelfStats {
 
 const tokenKey = bookStoragePrefix + '-token'
 const accountKey = bookStoragePrefix + '-account'
+const profileKey = (userId: string) => `${bookStoragePrefix}-profile:${userId}`
+
+interface AccountProfile {
+  userName: string
+  nickName: string
+  avatar: string
+}
+
+interface AccountInfo {
+  user?: Partial<AccountProfile> & { userId?: number | string }
+}
 
 const token = ref<string>(uni.getStorageSync(tokenKey) || '')
 const account = ref<string>(uni.getStorageSync(accountKey) || '')
+const profile = ref<AccountProfile | null>(token.value && account.value ? uni.getStorageSync(profileKey(account.value)) || null : null)
 const nodes = ref<BookNode[]>([])
 const loading = ref(false)
 const error = ref('')
@@ -302,6 +314,7 @@ export function clearSession() {
   token.value = ''
 
   account.value = ''
+  profile.value = null
   nodes.value = []
   uni.removeStorageSync(tokenKey)
   uni.removeStorageSync(accountKey)
@@ -311,8 +324,35 @@ export function clearSession() {
 export function setSession(value: string, userId: string) {
   token.value = value
   account.value = userId
+  profile.value = userId ? uni.getStorageSync(profileKey(userId)) || null : null
   uni.setStorageSync(tokenKey, value)
   uni.setStorageSync(accountKey, userId)
+}
+
+/** 获取当前登录用户的资料，并为离线显示按用户缓存。 */
+export async function refreshAccountProfile() {
+  const sessionToken = token.value
+  const sessionAccount = account.value
+  const { user } = await request<AccountInfo>('/getInfo')
+  const userId = String(user?.userId || '')
+  if (!userId || (sessionAccount && sessionAccount !== userId)) {
+    throw new ApiError('无法读取账号信息，请重试', 502)
+  }
+  if (sessionToken !== token.value || sessionAccount !== account.value) {
+    throw new ApiError('登录账号已变化', 499)
+  }
+  if (!sessionAccount) setSession(sessionToken, userId)
+  const fresh = {
+    userName: user?.userName?.trim() || '',
+    nickName: user?.nickName?.trim() || '',
+    avatar: user?.avatar?.trim() || ''
+  }
+  profile.value = fresh
+  try {
+    uni.setStorageSync(profileKey(userId), fresh)
+  } catch {
+    // 存储空间不足时，当前会话仍可使用已取得的资料。
+  }
 }
 
 /** 登录态与全局节点的只读入口。 */
@@ -320,6 +360,7 @@ export function useBookStore() {
   return {
     token: computed(() => token.value),
     account: computed(() => account.value),
+    profile: computed(() => profile.value),
     nodes: computed(() => nodes.value),
     loading: computed(() => loading.value),
     error: computed(() => error.value),

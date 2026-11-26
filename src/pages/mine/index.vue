@@ -1,10 +1,15 @@
 <template>
-  <AppPage :loading="loading" title="我的">
+  <AppPage :loading="loading && !profile" title="我的">
     <scroll-view class="scroll" scroll-y>
       <view class="profile card">
-        <view class="avatar-lg">我</view>
-        <view class="grow">
-          <text class="profile-name">读书账号</text>
+        <view class="avatar-lg">
+          <image v-if="avatarSrc && !avatarFailed" :key="avatarSrc" class="avatar-image" :src="avatarSrc"
+            mode="aspectFill" aria-label="用户头像" @error="avatarFailed = true" />
+          <text v-else aria-hidden="true">{{ avatarInitial }}</text>
+        </view>
+        <view class="grow profile-info">
+          <text class="profile-name">{{ profileName || '读书账号' }}</text>
+          <text v-if="profile?.userName && profile.userName !== profileName" class="profile-account">@{{ profile.userName }}</text>
         </view>
         <button class="btn xs line" @click="logout">退出登录</button>
       </view>
@@ -65,15 +70,15 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { onShow } from '@dcloudio/uni-app'
 import AppPage from '../../components/AppPage.vue'
 import AppToast from '../../components/AppToast.vue'
 import AppTabbar from '../../components/AppTabbar.vue'
 import AppIcon from '../../components/AppIcon.vue'
-import { bookStoragePrefix } from '../../api-env'
+import { baseApi, bookStoragePrefix } from '../../api-env'
 import { ROUTES } from '../../shared/navigation'
-import { clearSession, fetchNodes, shelfStats, useBookStore, useTheme } from '../../shared/store'
+import { clearSession, fetchNodes, refreshAccountProfile, shelfStats, useBookStore, useTheme } from '../../shared/store'
 import type { BookNode } from '../../shared/types'
 import { requireLogin } from '../../shared/use-book'
 import { toast } from '../../shared/toast'
@@ -81,6 +86,18 @@ import { pendingNotes, type PendingNote } from '../../shared/pending-notes'
 import { noteSyncOffline, noteSyncRunning, retryPendingNote } from '../../shared/note-sync'
 
 const store = useBookStore()
+const profile = store.profile
+const profileName = computed(() => profile.value?.nickName || profile.value?.userName || '')
+const avatarInitial = computed(() => Array.from(profileName.value)[0] || '我')
+const avatarSrc = computed(() => {
+  const avatar = profile.value?.avatar
+  if (!avatar) return ''
+  if (/^https?:\/\//i.test(avatar)) return avatar
+  return `${baseApi()}/${avatar.replace(/^\/+/, '')}`
+})
+const avatarFailed = ref(false)
+watch(avatarSrc, () => { avatarFailed.value = false })
+
 const theme = useTheme()
 const tree = ref<BookNode[]>([])
 const cacheCount = ref(0)
@@ -166,7 +183,10 @@ function logout() {
 }
 
 onShow(() => {
-  if (requireLogin()) void load()
+  if (!requireLogin()) return
+  avatarFailed.value = false
+  void refreshAccountProfile().catch(() => { if (!store.token.value) requireLogin() })
+  void load()
 })
 </script>
 
@@ -184,6 +204,7 @@ onShow(() => {
   height: 44px;
   flex: 0 0 44px;
   border-radius: 50%;
+  overflow: hidden;
   background: var(--wood-200);
   color: var(--wood-900);
   display: flex;
@@ -192,7 +213,13 @@ onShow(() => {
   font-size: 15px;
   font-weight: 600;
 }
-.profile-name { display: block; font-family: var(--serif); font-size: 15px; font-weight: 600; }
+.avatar-image { width: 100%; height: 100%; display: block; }
+.profile-info { min-width: 0; }
+.profile-name,
+.profile-account { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.profile-name { font-family: var(--serif); font-size: 15px; font-weight: 600; }
+.profile-account { margin-top: 3px; font-size: 12px; color: var(--ink-500); }
+.profile .btn { flex-shrink: 0; }
 .row-title { font-size: 13px; font-weight: 650; }
 
 .theme-row { display: flex; gap: 7px; margin-top: 10px; }
