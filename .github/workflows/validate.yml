@@ -1,0 +1,31 @@
+name: 悟 CI 校验
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      VITE_APP_TURNSTILE_PAGE: ${{ vars.VITE_APP_TURNSTILE_PAGE }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+      - name: 安装锁定依赖
+        run: npm ci --registry=https://registry.npmjs.org --replace-registry-host=registry.npmmirror.com
+      - run: npm run type-check
+      - run: npm run build:h5
+      - run: npm run build:wgt

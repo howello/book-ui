@@ -1,0 +1,74 @@
+name: 悟 App 热更新发布
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - '.env.production'
+      - 'package*.json'
+      - 'vite.config.ts'
+      - 'tsconfig.json'
+      - 'scripts/release-wgt.mjs'
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: 更新说明
+        type: string
+
+concurrency:
+  group: book-wgt-production
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      VITE_APP_TURNSTILE_PAGE: ${{ vars.VITE_APP_TURNSTILE_PAGE }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+      - name: 安装锁定依赖
+        run: npm ci --registry=https://registry.npmjs.org --replace-registry-host=registry.npmmirror.com
+      - run: npm run type-check
+      - run: npm run build:app
+      - name: 发布 WGT 到读书笔记渠道
+        id: release
+        env:
+          BOOK_PUBLISH_TOKEN: ${{ secrets.BOOK_PUBLISH_TOKEN }}
+          BOOK_RELEASE_API: ${{ vars.BOOK_RELEASE_API }}
+          RELEASE_NOTES: ${{ inputs.notes }}
+        run: |
+          git fetch --no-tags origin main
+          if [ "$(git rev-parse FETCH_HEAD)" != "$(git rev-parse HEAD)" ]; then
+            echo '::error::main 已更新，请使用最新提交的发版运行。'
+            exit 1
+          fi
+          node scripts/release-wgt.mjs --publish --write-back --notes "$RELEASE_NOTES"
+      - name: 写回已发布的版本号
+        env:
+          VERSION_NAME: ${{ steps.release.outputs.version_name }}
+          VERSION_CODE: ${{ steps.release.outputs.version_code }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- src/manifest.json
+          git commit -m "chore: 自动同步读书笔记版本 $VERSION_NAME ($VERSION_CODE) [skip ci]"
+          git push origin HEAD:refs/heads/main
+      - name: 留存 WGT 和校验信息
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: book-wgt-${{ github.run_id }}
+          path: dist/release/wgt/
+          if-no-files-found: ignore
+          retention-days: 30
