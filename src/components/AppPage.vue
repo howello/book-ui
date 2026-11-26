@@ -5,6 +5,9 @@
         <text class="chev">‹</text>
       </button>
       <button v-else-if="backText" class="act act-left act-text" @click="onBack">{{ backText }}</button>
+      <view v-if="$slots['action-left']" class="nav-action nav-action-left">
+        <slot name="action-left" />
+      </view>
       <view class="title">
         <text class="title-main">{{ title }}</text>
         <text v-if="subtitle" class="sub">{{ subtitle }}</text>
@@ -95,6 +98,7 @@ const props = withDefaults(defineProps<{
   /** 书架骨架每行卡片数 */
   shelfColumns?: number
   showNav?: boolean
+  beforeBack?: () => boolean
 }>(), {
   title: '', subtitle: '', back: false, backText: '', backLabel: '返回',
   skeleton: 'list', shelfColumns: 2, showNav: true
@@ -104,7 +108,7 @@ const theme = useTheme()
 const themeClass = computed(() => (theme.theme === 'dark' ? 'theme-dark' : ''))
 
 function onBack() {
-  goBack()
+  if (props.beforeBack?.() !== false) goBack()
 }
 </script>
 

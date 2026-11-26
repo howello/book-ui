@@ -76,12 +76,12 @@
           <AppIcon name="trash" :size="13" />删除分类
         </button>
         <text class="tiny danger-note">
-          {{ bookCount ? `分类下还有 ${bookCount} 本书，需先移走或一并删除` : '删除后可在回收站恢复' }}
+          {{ bookCount ? `分类下还有 ${bookCount} 本书，需先移走或一并删除` : '删除后无法恢复' }}
         </text>
       </view>
     </scroll-view>
 
-    <AppSheet v-model="deleteOpen" :title="`删除「${form.name || '分类'}」？`" :subtitle="bookCount ? `分类下还有 ${bookCount} 本书，会一并进入回收站` : '删除后可在回收站恢复'">
+    <AppSheet v-model="deleteOpen" :title="`删除「${form.name || '分类'}」？`" :subtitle="bookCount ? `分类下还有 ${bookCount} 本书，会一并删除` : '删除后无法恢复'">
       <view class="sheet-acts">
         <button class="btn line" @click="deleteOpen = false">取消</button>
         <button class="btn backdrop" @click="confirmRemove">确认删除</button>
@@ -271,7 +271,7 @@ async function confirmRemove() {
   deleteOpen.value = false
   try {
     await removeNode(categoryId.value)
-    toast('已移入回收站，30 天内可恢复')
+    toast('已删除')
     uni.reLaunch({ url: ROUTES.home })
   } catch (failure) {
     toast(failure instanceof Error ? failure.message : '删除失败')

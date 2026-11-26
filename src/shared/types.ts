@@ -23,6 +23,7 @@ export interface NoteBlock {
 
 /** 感悟附件（与块分离保存，便于上传与离线缓存）。 */
 export interface Attachment {
+  id?: string
   kind: 'image' | 'audio'
   url?: string
   localKey?: string
@@ -97,6 +98,12 @@ export function stringifyContent(content: NodeContent): string | null {
 
 /** 读取节点正文中的块数组。 */
 export function blocksOf(node?: BookNode | null): NoteBlock[] {
-  const blocks = parseContent(node).blocks
-  return Array.isArray(blocks) ? blocks : []
+  const content = parseContent(node)
+  if (Array.isArray(content.blocks)) return content.blocks
+  const blocks: NoteBlock[] = []
+  if (content.text) blocks.push({ id: 'legacy-text', type: 'text', text: content.text })
+  for (const [index, item] of (Array.isArray(content.attachments) ? content.attachments : []).entries()) {
+    if (item.url) blocks.push({ id: 'legacy-media-' + index, type: item.kind, url: item.url })
+  }
+  return blocks
 }

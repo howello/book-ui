@@ -1,5 +1,7 @@
 import { bookStoragePrefix } from '../api-env'
 import { mediaBlob } from '../media-cache'
+import { onUnmounted, reactive, watch } from 'vue'
+import type { NoteBlock } from './types'
 
 /** H5 媒体缓存键前缀，包含账号避免串号。 */
 const keyPrefix = bookStoragePrefix + '-media:'
@@ -9,10 +11,10 @@ export function newLocalKey(account: string) {
   return `${account}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 10)}`
 }
 
-/** H5：把 Blob 写入 IndexedDB，并返回可用于立即预览的 Object URL。 */
+/** H5：把原文件写入 IndexedDB，返回可跨重启使用的键。 */
 export async function saveLocalBlob(key: string, blob: Blob): Promise<string> {
   await mediaBlob(key, blob)
-  return URL.createObjectURL(blob)
+  return key
 }
 
 /** H5：读取本地媒体 Blob。 */
@@ -20,6 +22,56 @@ export function readLocalBlob(key: string): Promise<Blob | undefined> {
   return mediaBlob(key)
 }
 
+/** 保存相册或录音的临时文件。 */
+export async function keepNoteMedia(owner: string, tempPath: string): Promise<string> {
+  const key = newLocalKey(owner)
+  // #ifdef H5
+  const response = await fetch(tempPath)
+  if (!response.ok) throw new Error('无法读取附件')
+  return saveLocalBlob(key, await response.blob())
+  // #endif
+  // #ifdef APP-PLUS
+  const path = await new Promise<string>((resolve, reject) => uni.saveFile({
+    tempFilePath: tempPath,
+    success: result => resolve(result.savedFilePath),
+    fail: reject
+  }))
+  uni.setStorageSync(keyPrefix + key, path)
+  return key
+  // #endif
+}
+
+/** 只使用本账号在本机保存的附件。 */
+export function localMediaPath(owner: string, key?: string): string {
+  return owner && key?.startsWith(owner + ':') ? cachedMedia(key) : ''
+}
+
+/** 根据本机引用恢复页面上的临时预览地址。 */
+export function useNoteMedia(owner: () => string, blocks: () => NoteBlock[]) {
+  const previews = reactive(new Map<string, string>())
+  // #ifdef H5
+  watch(() => ({ owner: owner(), keys: blocks().map(block => block.localKey) }),
+    ({ owner: current, keys }, _, cleanup) => {
+      let active = true
+      cleanup(() => { active = false })
+      for (const [key, url] of previews) {
+        if (!key.startsWith(current + ':') || !keys.includes(key)) {
+          URL.revokeObjectURL(url)
+          previews.delete(key)
+        }
+      }
+      for (const key of keys) {
+        if (!current || !key?.startsWith(current + ':') || previews.has(key)) continue
+        void readLocalBlob(key).then(blob => {
+          if (active && blob && !previews.has(key)) previews.set(key, URL.createObjectURL(blob))
+        }).catch(() => undefined)
+      }
+    }, { immediate: true })
+  onUnmounted(() => previews.forEach(url => URL.revokeObjectURL(url)))
+  // #endif
+  return (block: NoteBlock) => (block.localKey &&
+    (previews.get(block.localKey) || localMediaPath(owner(), block.localKey))) || block.url || ''
+}
 /** 已上传媒体的展示地址：优先本机缓存，其次原始地址。 */
 export function rememberMedia(url: string, localPath: string) {
   try {

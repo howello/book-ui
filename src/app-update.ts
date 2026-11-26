@@ -148,7 +148,7 @@ async function runUpdate(manual: boolean): Promise<'latest' | void> {
   const current = await readWidgetVersion()
   if (!current) throw new Error('无法读取当前应用版本')
   const update = await fetchUpdate(current)
-  if (update.appKey !== 'book') throw new Error('读书笔记版本服务尚未开启')
+  if (update.appKey !== 'book') throw new Error('悟的版本服务尚未开启')
   if (update.update === false) return 'latest'
   if (update.update !== true || !Number.isSafeInteger(update.versionCode)) throw new Error('更新版本信息无效')
   if (Number(update.versionCode) <= current.versionCode) return 'latest'

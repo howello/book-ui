@@ -3,7 +3,7 @@
     <scroll-view class="scroll about" scroll-y>
       <view class="about-hero">
         <view class="app-logo-frame">
-          <AppIcon name="book" :size="40" />
+          <image class="brand-icon" src="/static/icons/app/192x192.png" mode="aspectFit" aria-label="悟" />
         </view>
         <text class="app-name">{{ manifest.name }}</text>
         <text class="app-description">分类 · 书本 · 感悟 · 备注，一棵能无限下钻的树</text>
@@ -34,7 +34,6 @@ import { computed, reactive, ref } from 'vue'
 import { onShow } from '@dcloudio/uni-app'
 import AppPage from '../../components/AppPage.vue'
 import AppToast from '../../components/AppToast.vue'
-import AppIcon from '../../components/AppIcon.vue'
 import manifest from '../../manifest.json'
 import { checkAppUpdateManually, readWidgetVersion } from '../../app-update'
 import { toast } from '../../shared/toast'
@@ -104,6 +103,7 @@ onShow(async () => {
   box-shadow: var(--shadow-card);
 }
 
+.brand-icon { width: 100%; height: 100%; border-radius: inherit; }
 .app-logo-frame {
   display: flex;
   align-items: center;

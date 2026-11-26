@@ -126,11 +126,11 @@
         <button class="btn line danger" @click="remove">
           <AppIcon name="trash" :size="13" />删除这本书
         </button>
-        <text class="tiny danger-note">删除会连同其下感悟与备注一起进入回收站，30 天内可恢复</text>
+        <text class="tiny danger-note">删除会一并删除其下的感悟与备注</text>
       </view>
     </scroll-view>
 
-    <AppSheet v-model="deleteOpen" :title="`删除《${form.title || '这本书'}》？`" :subtitle="`${noteTotal} 条感悟与 ${remarkTotal} 条备注会一并进入回收站`">
+    <AppSheet v-model="deleteOpen" :title="`删除《${form.title || '这本书'}》？`" :subtitle="`${noteTotal} 条感悟与 ${remarkTotal} 条备注会一并删除`">
       <view class="sheet-acts">
         <button class="btn line" @click="deleteOpen = false">取消</button>
         <button class="btn backdrop" @click="confirmRemove">确认删除</button>
@@ -397,7 +397,7 @@ async function confirmRemove() {
   if (!bookId.value) return
   try {
     await removeNode(bookId.value)
-    toast('已移入回收站，30 天内可恢复')
+    toast('已删除')
     if (form.parentId) uni.redirectTo({ url: `${ROUTES.category}?id=${form.parentId}` })
     else uni.reLaunch({ url: ROUTES.home })
   } catch (failure) {

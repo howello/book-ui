@@ -3,9 +3,9 @@
     <view class="login-shell">
       <view class="login-brand">
         <view class="logo-frame">
-          <AppIcon name="book" :size="42" />
+          <image class="brand-icon" src="/static/icons/app/192x192.png" mode="aspectFit" aria-label="悟" />
         </view>
-        <text class="login-title">读书笔记</text>
+        <text class="login-title">悟</text>
         <text class="login-subtitle">把读过的书，放回自己的书架</text>
       </view>
 
@@ -281,6 +281,7 @@ async function submit() {
   text-align: center;
 }
 
+.brand-icon { width: 100%; height: 100%; border-radius: inherit; }
 .logo-frame {
   display: flex;
   align-items: center;

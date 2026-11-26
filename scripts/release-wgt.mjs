@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
-const appId = '__UNI__B006001'
+const appId = '__UNI__A20E975'
 const appKey = 'book'
 const { values } = parseArgs({
   options: {

@@ -244,7 +244,7 @@ async function removeRemark() {
   const confirmed = await new Promise<boolean>(resolve => {
     uni.showModal({
       title: '删除这条备注？',
-      content: children.value.length ? '会同时删除其下全部子备注' : '删除后可在回收站恢复',
+      content: children.value.length ? '会同时删除其下全部子备注' : '删除后无法恢复',
       confirmText: '确认删除',
       success: result => resolve(result.confirm),
       fail: () => resolve(false)
@@ -253,7 +253,7 @@ async function removeRemark() {
   if (!confirmed) return
   try {
     await removeNode(remarkId.value)
-    toast('已移入回收站')
+    toast('已删除')
     const parent = parentRemark.value
     if (parent) uni.redirectTo({ url: `${ROUTES.remark}?id=${parent.id}` })
     else if (rootNote.value) uni.redirectTo({ url: `${ROUTES.note}?id=${rootNote.value.id}` })

@@ -145,7 +145,7 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { onLoad, onShow } from '@dcloudio/uni-app'
+import { onLoad, onShow, onUnload } from '@dcloudio/uni-app'
 import AppPage from '../../components/AppPage.vue'
 import AppToast from '../../components/AppToast.vue'
 import AppIcon from '../../components/AppIcon.vue'
@@ -153,17 +153,18 @@ import AppImage from '../../components/AppImage.vue'
 import SortMenu from '../../components/SortMenu.vue'
 import AppSheet from '../../components/AppSheet.vue'
 import { ROUTES, goHome } from '../../shared/navigation'
-import { fetchNodes, removeNode, useBookStore } from '../../shared/store'
+import { ApiError, fetchNode, fetchNodes, removeNode, useBookStore } from '../../shared/store'
 import type { BookNode, NoteBlock } from '../../shared/types'
 import { blocksOf, parseContent } from '../../shared/types'
 import { pageOption, requireLogin, saveNode } from '../../shared/use-book'
-import { formatDuration } from '../../shared/media'
+import { formatDuration, useNoteMedia } from '../../shared/media'
 import { noteMarkdown, saveMarkdown } from '../../shared/export-markdown'
 import { toast } from '../../shared/toast'
 
 const store = useBookStore()
 const noteId = ref('')
 const tree = ref<BookNode[]>([])
+const detail = ref<BookNode>()
 const error = ref('')
 /** 备注排序：最新在前 / 最早在前 / 按层级（层级内再按时间）。 */
 const remarkSortLabels = ['最新在前', '最早在前', '按层级']
@@ -179,7 +180,7 @@ const posting = ref(false)
 const playingId = ref('')
 let player: UniApp.InnerAudioContext | undefined
 
-const note = computed(() => tree.value.find(node => node.id === noteId.value))
+const note = computed(() => detail.value)
 const content = computed(() => parseContent(note.value))
 const blocks = computed(() => blocksOf(note.value))
 const book = computed(() => tree.value.find(node => node.id === note.value?.parentId))
@@ -231,15 +232,14 @@ function waveHeights(seed: string) {
 }
 
 /** 图片块展示地址：本地预览优先，其次已上传地址。 */
-function blockSrc(block: NoteBlock) {
-  return block.url || ''
-}
+const blockSrc = useNoteMedia(() => store.account.value, () => blocks.value)
 
 function play(block: NoteBlock) {
-  if (!block.url) { toast('语音尚未上传或已失效'); return }
+  const src = blockSrc(block)
+  if (!src) { toast('语音尚未加载或已失效'); return }
   player?.destroy()
   player = uni.createInnerAudioContext()
-  player.src = block.url
+  player.src = src
   playingId.value = block.id
   player.onEnded(() => { playingId.value = '' })
   player.onError(() => { playingId.value = ''; toast('语音播放失败') })
@@ -334,7 +334,7 @@ async function removeNote() {
   const confirmed = await new Promise<boolean>(resolve => {
     uni.showModal({
       title: '删除这条感悟？',
-      content: related ? `会同时删除其下 ${related} 条备注` : '删除后可在回收站恢复',
+      content: related ? `会同时删除其下 ${related} 条备注` : '删除后无法恢复',
       confirmText: '确认删除',
       success: result => resolve(result.confirm),
       fail: () => resolve(false)
@@ -343,7 +343,7 @@ async function removeNote() {
   if (!confirmed) return
   try {
     await removeNode(noteId.value)
-    toast('已移入回收站')
+    toast('已删除')
     if (book.value) uni.redirectTo({ url: `${ROUTES.book}?id=${book.value.id}` })
     else goHome()
   } catch (failure) {
@@ -361,8 +361,16 @@ async function load() {
   loading.value = true
   hasLoaded = true
   try {
-    tree.value = await fetchNodes({ tree: true })
-    if (!note.value && noteId.value) error.value = '感悟不存在或已删除'
+    const [rows, node] = await Promise.allSettled([fetchNodes({ tree: true }), fetchNode(noteId.value)])
+    if (rows.status === 'fulfilled') tree.value = rows.value
+    if (node.status === 'fulfilled') detail.value = node.value
+    else if (node.reason instanceof ApiError && node.reason.status === 0) {
+      detail.value = tree.value.find(item => item.id === noteId.value && item.contentJson !== undefined)
+      if (!detail.value) throw node.reason
+    } else {
+      detail.value = undefined
+      throw node.reason
+    }
   } catch (failure) {
     error.value = failure instanceof Error ? failure.message : '加载失败'
   } finally {
@@ -377,6 +385,7 @@ onLoad(options => {
 onShow(() => {
   if (store.token.value) void load()
 })
+onUnload(() => player?.destroy())
 </script>
 
 <style scoped>

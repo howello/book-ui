@@ -8,6 +8,7 @@
     "dev:app": "uni -p app",
     "build:h5": "uni build --mode production && node scripts/offline-shell.mjs",
     "build:h5:stage": "uni build --mode staging --outDir dist/staging/h5 && node scripts/offline-shell.mjs dist/staging/h5",
+    "deploy:h5": "npm run build:h5 && wrangler deploy --config wrangler.jsonc",
     "build:app": "uni build -p app --mode production",
     "build:app:stage": "uni build -p app --mode staging --outDir dist/staging/app",
     "type-check": "vue-tsc --noEmit",

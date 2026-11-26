@@ -38,25 +38,22 @@
           <text class="data-value">{{ cacheCount }} 个</text>
         </view>
         <view class="data-row">
-          <text class="tiny">待保存草稿</text>
-          <text class="data-value">{{ drafts.length }} 条</text>
+          <text class="tiny">感悟同步</text>
+          <text class="data-value">{{ syncStatus }}</text>
         </view>
-        <view v-for="draft in drafts" :key="draft.id" class="draft-row" @click="continueDraft(draft)">
-          <view class="grow">
-            <text class="draft-title">{{ draft.title }}</text>
-            <text class="tiny">{{ TYPE_NAMES[draft.nodeType as NodeType] || '感悟' }} · {{ dateText(draft.savedAt) }}</text>
+        <view v-for="entry in problems" :key="entry.node.id" class="sync-row">
+          <view class="grow" @click="openPending(entry)">
+            <text class="sync-title">{{ entry.node.title }}</text>
+            <text class="tiny">{{ entry.problem }}</text>
           </view>
-          <button class="draft-del" :aria-label="'删除草稿 ' + draft.title" @click.stop="removeDraft(draft)">
-            <AppIcon name="trash" :size="13" />
-          </button>
-          <AppIcon name="chev" :size="12" />
+          <button v-if="entry.problemCode === 409" class="btn xs line" @click="resolveConflict(entry)">处理</button>
         </view>
         <button class="btn line cache-btn" @click="clearCache">清理本机缓存</button>
       </view>
 
       <view class="card">
         <view class="link-row" role="button" @click="openAbout">
-          <text class="row-title">关于读书笔记</text>
+          <text class="row-title">关于悟</text>
           <AppIcon name="chev" :size="13" />
         </view>
       </view>
@@ -80,59 +77,44 @@ import { clearSession, fetchNodes, shelfStats, useBookStore, useTheme } from '..
 import type { BookNode } from '../../shared/types'
 import { requireLogin } from '../../shared/use-book'
 import { toast } from '../../shared/toast'
-import { clearDraft, listDrafts, type DraftSummary } from '../../shared/draft'
-import { TYPE_NAMES } from '../../shared/store'
-import type { NodeType } from '../../shared/types'
+import { pendingNotes, type PendingNote } from '../../shared/pending-notes'
+import { noteSyncOffline, noteSyncRunning, retryPendingNote } from '../../shared/note-sync'
 
 const store = useBookStore()
 const theme = useTheme()
 const tree = ref<BookNode[]>([])
 const cacheCount = ref(0)
-const drafts = ref<DraftSummary[]>([])
+const pending = computed(() => pendingNotes(store.account.value))
+const problems = computed(() => pending.value.filter(entry => entry.problem))
+const syncStatus = computed(() => {
+  if (noteSyncOffline.value) return `离线 · ${pending.value.length} 条待上传`
+  if (noteSyncRunning.value) return `正在同步 · ${pending.value.length} 条`
+  if (pending.value.length) return `${pending.value.length} 条待上传`
+  return '已同步'
+})
 
 const stats = computed(() => shelfStats(tree.value))
 
-/** 缓存与草稿按当前账号统计，切换账号后立即变化。 */
+/** 缓存按当前账号统计。 */
 function refreshStorage() {
   const owner = store.account.value
   const keys = uni.getStorageInfoSync().keys
   cacheCount.value = keys.filter(key => key.startsWith(`${bookStoragePrefix}-cache:${owner}:`)).length
-  drafts.value = listDrafts(owner)
 }
 
-/** 草稿保存时间显示为「MM-DD HH:mm」。 */
-function dateText(time: number) {
-  if (!time) return ''
-  const date = new Date(time)
-  const pad = (value: number) => String(value).padStart(2, '0')
-  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+function openPending(entry: PendingNote) {
+  uni.navigateTo({ url: `${ROUTES.noteEdit}?id=${entry.node.id}` })
 }
 
-/** 删除单条草稿：只清本机记录，不涉及服务器数据。 */
-async function removeDraft(draft: DraftSummary) {
-  const confirmed = await new Promise<boolean>(resolve => {
-    uni.showModal({
-      title: '删除这条草稿？',
-      content: '只删除本机未提交的内容，已保存的节点不受影响',
-      confirmText: '删除',
-      confirmColor: '#8C3B2E',
-      success: result => resolve(result.confirm),
-      fail: () => resolve(false)
-    })
+function resolveConflict(entry: PendingNote) {
+  uni.showModal({
+    title: '使用本机版本？',
+    content: '云端已有其他修改。确认后将用本机内容覆盖云端版本。',
+    confirmText: '使用本机',
+    success: result => {
+      if (result.confirm) void retryPendingNote(entry.node.id).catch(error => toast(error.message))
+    }
   })
-  if (!confirmed) return
-  clearDraft(store.account.value, draft.id)
-  drafts.value = listDrafts(store.account.value)
-  toast('草稿已删除')
-}
-
-/** 继续编辑草稿：感悟草稿回到写感悟页，其余类型先跳对应列表页。 */
-function continueDraft(draft: DraftSummary) {
-  const target = draft.nodeType === 'note'
-    ? (draft.id.startsWith('new:') ? '/pages/note/edit?parentId=' : '/pages/note/edit?id=')
-    : '/pages/home/index'
-  const url = draft.nodeType === 'note' && !draft.id.startsWith('new:') ? target + draft.id : target
-  uni.navigateTo({ url })
 }
 
 function openAbout() {
@@ -231,42 +213,6 @@ onShow(() => {
 .data-value { font-size: 12.5px; color: var(--ink-700); font-weight: 600; }
 .cache-btn { margin-top: 12px; }
 
-.draft-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
-  padding: 9px 10px;
-  border-radius: 9px;
-  background: var(--surface-2);
-  border: 1px solid var(--line);
-}
-.draft-del {
-  flex: 0 0 auto;
-  width: 28px;
-  height: 28px;
-  margin: 0;
-  padding: 0;
-  border: 0;
-  border-radius: 50%;
-  background: transparent;
-  color: var(--ink-400);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-.draft-del:active { background: var(--red-100); color: var(--red-700); }
-
-.draft-title {
-  display: block;
-  font-size: 12.5px;
-  font-weight: 600;
-  color: var(--ink-800);
-  margin-bottom: 1px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.link-row { display: flex; align-items: center; justify-content: space-between; color: var(--ink-700); }
+.sync-row { display: flex; align-items: center; gap: 8px; padding-top: 10px; }
+.sync-title { display: block; font-size: 13px; color: var(--ink-800); }
 </style>

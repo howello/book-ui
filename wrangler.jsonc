@@ -1,0 +1,9 @@
+{
+  "name": "book-ui",
+  "compatibility_date": "2025-04-01",
+  "workers_dev": true,
+  "assets": {
+    "directory": "./dist/build/h5",
+    "not_found_handling": "single-page-application"
+  }
+}

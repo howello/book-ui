@@ -6,7 +6,7 @@
     </button>
 
     <view v-if="open" class="sort-mask" @click="open = false" />
-    <view v-if="open" class="sort-pop">
+    <view v-if="open" class="sort-pop" :class="{ left: align === 'left' }">
       <button
         v-for="(option, i) in options"
         :key="option"
@@ -29,10 +29,12 @@ import AppIcon from './AppIcon.vue'
  * 轻量下拉选择：点触发按钮弹出选项浮层。
  * 不用原生 picker，避免各端交互与样式不一致，也让排序入口保持统一。
  */
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   options: string[]
   index: number
-}>()
+  /** 弹层对齐方向：right 默认贴右，left 用于放在页面左上角的入口 */
+  align?: 'left' | 'right'
+}>(), { align: 'right' })
 
 const emit = defineEmits<{ change: [index: number] }>()
 
@@ -70,13 +72,18 @@ function choose(i: number) {
   position: absolute;
   right: 0;
   top: 32px;
+  min-width: 132px;
   z-index: 61;
-  min-width: 118px;
   padding: 5px;
   border-radius: 11px;
   border: 1px solid var(--line);
   background: var(--paper-2);
   box-shadow: 0 8px 24px -10px rgba(74, 53, 32, 0.45);
+}
+
+.sort-pop.left {
+  right: auto;
+  left: 0;
 }
 
 .sort-option {

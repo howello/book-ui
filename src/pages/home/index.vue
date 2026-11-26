@@ -1,7 +1,11 @@
 <template>
   <AppPage :loading="loading" skeleton="shelf" :shelf-columns="perRow" title="我的书架" :show-nav="true">
+    <!-- 排序放左上角 -->
+    <template #action-left>
+      <SortMenu :options="sortLabels" :index="sortIndex" align="left" @change="setSort" />
+    </template>
     <template #action>
-      <button class="act-text" aria-label="新建分类" @click="openCreate">
+      <button class="act-text icon-btn" aria-label="新建分类" @click="openCreate">
         <AppIcon name="plus" :size="20" />
       </button>
     </template>
@@ -13,7 +17,7 @@
     <scroll-view class="scroll" scroll-y>
       <view v-if="error" class="error-tip">{{ error }}</view>
 
-      <view v-if="!categories.length && !loading" class="empty">
+      <view v-else-if="!categories.length && !loading" class="empty">
         <AppIcon name="folder" :size="34" />
         <text class="empty-text">还没有分类，先建一个吧</text>
       </view>
@@ -86,10 +90,12 @@ import AppTabbar from '../../components/AppTabbar.vue'
 import AppIcon from '../../components/AppIcon.vue'
 import AppImage from '../../components/AppImage.vue'
 import AppSheet from '../../components/AppSheet.vue'
+import SortMenu from '../../components/SortMenu.vue'
 import CoverFinder from '../../components/CoverFinder.vue'
 import { COVERS, COVER_KEYS, contentCover, coverImage, coverPalette, joinCoverRef } from '../../shared/covers'
+import { bookStoragePrefix } from '../../api-env'
 import { ROUTES } from '../../shared/navigation'
-import { childCount, fetchNodes, hydrate, removeNode, shelfStats, useBookStore } from '../../shared/store'
+import { childCount, hydrate, readCachedNodes, refreshNodes, removeNode, shelfStats, useBookStore } from '../../shared/store'
 import type { BookNode } from '../../shared/types'
 import { parseContent, stringifyContent } from '../../shared/types'
 import { saveNode } from '../../shared/use-book'
@@ -113,7 +119,49 @@ const press = useLongPress()
 
 const form = reactive({ title: '', desc: '', color: 'plum' })
 
-const categories = computed(() => tree.value.filter(node => node.nodeType === 'category'))
+/** 分类排序方式：时间 / 数量 / 名称。 */
+const sortLabels = ['按时间', '按数量', '按名称']
+const sortStorageKey = bookStoragePrefix + '-shelf-sort'
+/**
+ * 排序索引：0 时间 / 1 数量 / 2 名称。
+ * 默认按数量；uni 读不到时返回空串，需显式判断，不能直接 Number()。
+ */
+const savedSort = uni.getStorageSync(sortStorageKey)
+const sortIndex = ref(savedSort === '' || savedSort == null ? 1 : Number(savedSort))
+
+/** 切换排序方式并记住选择。 */
+function setSort(index: number) {
+  sortIndex.value = index
+  uni.setStorageSync(sortStorageKey, index)
+}
+
+/** 分类下书本数量（排序用）。 */
+function bookCountOf(node: BookNode) {
+  return tree.value.filter(item => item.parentId === node.id && item.nodeType === 'book').length
+}
+
+/**
+ * 分类列表，按当前排序方式排好。
+ *
+ * - 按时间：更新时间倒序（最近改过的在前）
+ * - 按数量：书本数量倒序（多的在前），相同按名称
+ * - 按名称：中文拼音序
+ */
+const categories = computed(() => {
+  const list = tree.value.filter(node => node.nodeType === 'category')
+  return [...list].sort((a, b) => {
+    if (sortIndex.value === 1) {
+      return bookCountOf(b) - bookCountOf(a) || a.title.localeCompare(b.title, 'zh')
+    }
+    if (sortIndex.value === 2) {
+      return a.title.localeCompare(b.title, 'zh')
+    }
+    // 按时间：updatedAt 缺失时回退 createdAt
+    const ta = a.updatedAt || a.createdAt || ''
+    const tb = b.updatedAt || b.createdAt || ''
+    return tb.localeCompare(ta) || a.title.localeCompare(b.title, 'zh')
+  })
+})
 
 /** 顶部统计：N 个分类 · M 本书 · 本周记了 K 条。 */
 const stats = computed(() => shelfStats(tree.value))
@@ -187,7 +235,7 @@ async function removeCategory() {
   const confirmed = await new Promise<boolean>(resolve => {
     uni.showModal({
       title: `删除「${node.title}」？`,
-      content: counts.books ? `分类下还有 ${counts.books} 本书，会一并进入回收站` : '删除后可在回收站恢复',
+      content: counts.books ? `分类下还有 ${counts.books} 本书，会一并删除` : '删除后无法恢复',
       confirmText: '确认删除',
       success: result => resolve(result.confirm),
       fail: () => resolve(false)
@@ -196,24 +244,53 @@ async function removeCategory() {
   if (!confirmed) return
   try {
     await removeNode(node.id)
-    toast('已移入回收站')
+    toast('已删除')
+    await refreshing
     await load()
   } catch (failure) {
     toast(failure instanceof Error ? failure.message : '删除失败')
   }
 }
 
-async function load() {
-  if (!store.token.value) return
-  loading.value = true
+let loadedFor: string | undefined
+let refreshing: Promise<void> | undefined
+
+function load() {
+  if (!refreshing) refreshing = refreshShelf().finally(() => { refreshing = undefined })
+  return refreshing
+}
+
+async function refreshShelf() {
+  const token = store.token.value
+  const owner = store.account.value
+  if (!token) return
+  const currentSession = () => token === store.token.value && owner === store.account.value
+  const cached = readCachedNodes({ tree: true })
+  if (cached !== undefined) {
+    tree.value = cached
+    loadedFor = owner
+  } else if (loadedFor !== owner) {
+    tree.value = []
+  }
+  loading.value = loadedFor !== owner
   error.value = ''
   try {
-    tree.value = await fetchNodes({ tree: true })
-    // 列表只返回摘要，分类的说明与配色需要补详情
-    await hydrate(tree.value.filter(node => node.nodeType === 'category'))
+    const fresh = await refreshNodes({ tree: true })
+    if (currentSession()) {
+      tree.value = fresh
+      loadedFor = owner
+      void hydrate(tree.value.filter(node => node.nodeType === 'category'))
+    }
   } catch (failure) {
-    error.value = failure instanceof Error ? failure.message : '加载失败'
+    if (currentSession() && loadedFor !== owner) {
+      error.value = failure instanceof Error ? failure.message : '加载失败'
+    }
   } finally {
+    if (!currentSession()) {
+      tree.value = []
+      loadedFor = undefined
+      requireLogin()
+    }
     loading.value = false
   }
 }
@@ -253,6 +330,8 @@ onShow(() => {
   color: var(--red-700);
   font-size: 12px;
 }
+
+.navbar .nav-action { gap: 8px; }
 
 .cat { display: block; width: 100%; padding: 0; border: 0; background: none; margin: 0; }
 

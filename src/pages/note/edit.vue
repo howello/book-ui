@@ -1,9 +1,9 @@
 <template>
-  <AppPage :loading="loading" :title="editing ? '编辑感悟' : '写感悟'" :subtitle="book ? `《${book.title}》` : ''" back back-text="取消">
+  <AppPage :loading="loading" :title="editing ? '编辑感悟' : '写感悟'" :subtitle="book ? `《${book.title}》` : ''" back :before-back="saveOnExit">
     <template #action>
       <button class="act act-text" :disabled="saving" :aria-busy="saving" @click="submit">
         <text v-if="saving" class="btn-spinner" />
-        <text>{{ saveLabel }}</text>
+        <text>{{ saving ? '保存中…' : '保存' }}</text>
       </button>
     </template>
 
@@ -96,8 +96,7 @@
       </view>
 
       <text class="tiny editor-hint">
-        正文是可排序的块序列：文字、图片、语音、引用各自独立，删除只影响单块。
-        保存时整篇存为一份块数组，不用把图文音拆成三张表。
+        退出时自动保存。离线修改会在联网后自动上传。
       </text>
     </scroll-view>
     <AppToast />
@@ -105,21 +104,22 @@
 </template>
 
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue'
-import { onLoad } from '@dcloudio/uni-app'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { onBackPress, onHide, onLoad, onUnload } from '@dcloudio/uni-app'
 import AppPage from '../../components/AppPage.vue'
 import AppToast from '../../components/AppToast.vue'
 import AppIcon from '../../components/AppIcon.vue'
 import AppImage from '../../components/AppImage.vue'
-import { baseApi } from '../../api-env'
+import { bookStoragePrefix } from '../../api-env'
 import { ROUTES } from '../../shared/navigation'
-import { fetchNode, fetchNodes, useBookStore } from '../../shared/store'
+import { ApiError, fetchNode, fetchNodes, useBookStore } from '../../shared/store'
 import type { BookNode, NoteBlock } from '../../shared/types'
 import { blocksOf, parseContent, stringifyContent } from '../../shared/types'
-import { pageOption, requireLogin, saveNode } from '../../shared/use-book'
-import { formatDuration, newLocalKey, saveLocalBlob } from '../../shared/media'
+import { newId, pageOption, requireLogin } from '../../shared/use-book'
+import { formatDuration, keepNoteMedia, newLocalKey, saveLocalBlob, useNoteMedia } from '../../shared/media'
 import { toast } from '../../shared/toast'
-import { clearDraft, draftId, readDraft, writeDraft } from '../../shared/draft'
+import { queueNote } from '../../shared/note-sync'
+import { pendingNote } from '../../shared/pending-notes'
 
 const store = useBookStore()
 const noteId = ref('')
@@ -127,10 +127,6 @@ const parentId = ref('')
 const bookId = ref('')
 const tree = ref<BookNode[]>([])
 const saving = ref(false)
-/** 保存阶段文案：上传附件时显示进度，避免用户以为卡住 */
-const saveLabel = ref('保存')
-const uploadTotal = ref(0)
-const uploadDone = ref(0)
 const editing = ref(false)
 
 const form = reactive({
@@ -140,31 +136,17 @@ const form = reactive({
   blocks: [] as NoteBlock[]
 })
 
-/** 当前编辑对象的草稿键：新建按类型区分，编辑按节点 ID。 */
-const currentDraftId = () => draftId(editing.value ? noteId.value : undefined, 'note')
-let draftTimer: ReturnType<typeof setTimeout> | undefined
-let draftReady = false
-
-/** 表单变化时防抖落本机草稿，断网或误退也能找回。 */
-watch(form, () => {
-  if (!draftReady || !store.account.value) return
-  clearTimeout(draftTimer)
-  draftTimer = setTimeout(() => {
-    writeDraft(store.account.value, currentDraftId(), {
-      title: form.title,
-      chapter: form.chapter,
-      tags: form.tags,
-      blocks: form.blocks,
-      parentId: parentId.value,
-      nodeType: 'note',
-      savedAt: Date.now()
-    })
-  }, 400)
-}, { deep: true })
+let baseNode: BookNode | undefined
+let account = ''
+let revision: string | undefined
+let legacyKey = ''
+let savedForm = ''
+let leftEditor = false
+let ready = false
 
 const book = computed(() => tree.value.find(node => node.id === bookId.value))
+const blockSrc = useNoteMedia(() => account, () => form.blocks)
 let player: UniApp.InnerAudioContext | undefined
-let localObjectUrl: string | undefined
 
 function newBlockId() {
   return 'b' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
@@ -182,7 +164,7 @@ function insert(type: NoteBlock['type']) {
   if (type === 'image') {
     const block = makeBlock('image')
     form.blocks.push(block)
-    pickImage(block)
+    pickImage(form.blocks[form.blocks.length - 1])
     return
   }
   form.blocks.push(makeBlock(type))
@@ -227,34 +209,23 @@ function addTag() {
   })
 }
 
-/** 图片块展示地址。 */
-function blockSrc(block: NoteBlock) {
-  return block.url || block.localKey || ''
-}
-
-/** 选一张图：H5 立即写入 IndexedDB 并生成预览地址，保存时上传。 */
+/** 在图库选中后立即保存原文件，退出或重启后仍可上传。 */
 function pickImage(block: NoteBlock) {
   uni.chooseImage({
     count: 1,
     sourceType: ['album', 'camera'],
     success: async result => {
       const path = Array.isArray(result.tempFilePaths) ? result.tempFilePaths[0] : result.tempFilePaths
-      if (!path) return
-      // #ifdef H5
-      const key = newLocalKey(store.account.value)
+      if (!path || !account || account !== store.account.value) return
       try {
-        const response = await fetch(path)
-        const blob = await response.blob()
-        localObjectUrl = await saveLocalBlob(key, blob)
-        block.localKey = localObjectUrl
+        const key = await keepNoteMedia(account, path)
+        if (account !== store.account.value || !form.blocks.some(item => item.id === block.id)) return
+        block.localKey = key
         block.url = ''
+        if (leftEditor) saveOnExit()
       } catch {
-        toast('图片读取失败')
+        toast('图片保存失败')
       }
-      // #endif
-      // #ifdef APP-PLUS
-      block.localKey = path
-      // #endif
     },
     fail: failure => {
       if (!failure.errMsg.includes('cancel')) toast('无法选择图片，请检查权限')
@@ -262,41 +233,57 @@ function pickImage(block: NoteBlock) {
   })
 }
 
-/* ---------- 录音 ---------- */
 const recording = ref(false)
 const recordSeconds = ref(0)
 let recordTimer: ReturnType<typeof setInterval> | undefined
 let browserRecorder: MediaRecorder | undefined
 let appRecorder: UniApp.RecorderManager | undefined
-let pendingAudio: NoteBlock | undefined
+let recordCompletion: Promise<void> | undefined
+let finishRecording: (() => void) | undefined
+
+async function insertRecording(saveFile: () => Promise<string>) {
+  const finish = finishRecording
+  if (!finish) return
+  finishRecording = undefined
+  const duration = recordSeconds.value
+  try {
+    const key = await saveFile()
+    if (account === store.account.value) {
+      form.blocks.push({ ...makeBlock('audio'), localKey: key, duration })
+      if (leftEditor) saveOnExit()
+    }
+  } catch {
+    toast('语音保存失败')
+  } finally {
+    recordCompletion = undefined
+    finish()
+  }
+}
 
 function recBarHeight(index: number) {
   return 5 + Math.round(Math.abs(Math.sin(index * 1.7 + recordSeconds.value / 3)) * 16)
 }
 
 async function startRecording() {
+  if (!ready || recording.value || recordCompletion) return
   // #ifdef H5
   try {
     if (!navigator.mediaDevices?.getUserMedia) throw new Error('录音需要 HTTPS 与麦克风权限')
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-    const chunks: BlobPart[] = []
-    browserRecorder = new MediaRecorder(stream)
-    browserRecorder.ondataavailable = event => chunks.push(event.data)
-    browserRecorder.onstop = async () => {
+    if (leftEditor || account !== store.account.value) {
       stream.getTracks().forEach(track => track.stop())
-      const block = makeBlock('audio')
-      const key = newLocalKey(store.account.value)
-      try {
-        const blob = new Blob(chunks, { type: browserRecorder?.mimeType || 'audio/webm' })
-        block.localKey = await saveLocalBlob(key, blob)
-        block.duration = recordSeconds.value
-        form.blocks.push(block)
-        toast('语音已插入，可稍后补充转写文字')
-      } catch {
-        toast('语音保存失败')
-      }
+      return
     }
-    browserRecorder.start()
+    const chunks: BlobPart[] = []
+    const recorder = new MediaRecorder(stream)
+    browserRecorder = recorder
+    recorder.ondataavailable = event => chunks.push(event.data)
+    recorder.onstop = () => {
+      stream.getTracks().forEach(track => track.stop())
+      void insertRecording(() => saveLocalBlob(newLocalKey(account),
+        new Blob(chunks, { type: recorder.mimeType || 'audio/webm' })))
+    }
+    recorder.start()
   } catch (failure) {
     toast(failure instanceof Error ? failure.message : '无法开始录音')
     return
@@ -305,32 +292,29 @@ async function startRecording() {
   // #ifdef APP-PLUS
   if (!appRecorder) {
     appRecorder = uni.getRecorderManager()
-    appRecorder.onStop(result => {
-      const block = makeBlock('audio')
-      block.localKey = result.tempFilePath
-      block.duration = recordSeconds.value
-      form.blocks.push(block)
-      toast('语音已插入')
+    appRecorder.onStop(result => { void insertRecording(() => keepNoteMedia(account, result.tempFilePath)) })
+    appRecorder.onError(() => {
+      stopRecording()
+      finishRecording?.()
+      finishRecording = undefined
+      recordCompletion = undefined
+      toast('录音失败')
     })
-    appRecorder.onError(() => toast('录音失败'))
   }
   appRecorder.start({ format: 'aac' })
   // #endif
+  recordCompletion = new Promise<void>(resolve => { finishRecording = resolve })
   recording.value = true
   recordSeconds.value = 0
-  clearInterval(recordTimer)
   recordTimer = setInterval(() => { recordSeconds.value += 1 }, 1000)
 }
 
 function stopRecording() {
-  try {
-    if (browserRecorder?.state === 'recording') browserRecorder.stop()
-    appRecorder?.stop()
-  } catch {
-    // 已经停止时忽略
-  }
+  if (!recording.value) return
   recording.value = false
   clearInterval(recordTimer)
+  if (browserRecorder?.state === 'recording') browserRecorder.stop()
+  appRecorder?.stop()
 }
 
 /* ---------- 播放 ---------- */
@@ -349,138 +333,111 @@ function waveHeights(seed: string) {
   return base.map((height, i) => Math.max(6, (height + offset + i * 3) % 26))
 }
 
-/* ---------- 上传 ---------- */
-function upload(path: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    uni.uploadFile({
-      url: baseApi() + '/common/upload',
-      filePath: path,
-      name: 'file',
-      header: { Authorization: 'Bearer ' + store.token.value },
-      success: response => {
-        try {
-          const body = JSON.parse(response.data) as { code?: number; url?: string; msg?: string }
-          if (response.statusCode === 200 && body.code === 200 && body.url) resolve(body.url)
-          else reject(new Error(body.msg || '附件上传失败'))
-        } catch {
-          reject(new Error('附件上传失败'))
-        }
-      },
-      fail: () => reject(new Error('附件上传失败'))
-    })
-  })
+/** 离开页面前同步写本机，上传由应用级队列处理。 */
+function persistNote(): boolean {
+  if (!ready || account !== store.account.value) return false
+  const snapshot = JSON.stringify(form)
+  if (snapshot === savedForm) return Boolean(baseNode?.title)
+  const blocks = form.blocks.filter(block =>
+    block.type === 'text' || block.type === 'quote' || block.url || block.localKey)
+  if (!baseNode?.title && !form.title.trim() && !form.chapter && !form.tags.length
+      && !blocks.some(block => block.text?.trim() || block.url || block.localKey)) return false
+  const title = form.title.trim() || baseNode?.title || '未命名感悟'
+  const body = blocks.filter(block => block.type === 'text').map(block => block.text || '').join('\n\n')
+  const node: BookNode = {
+    ...baseNode,
+    id: noteId.value,
+    parentId: parentId.value,
+    title,
+    nodeType: 'note',
+    sortOrder: baseNode?.sortOrder ?? tree.value.filter(item => item.parentId === parentId.value).length + 1,
+    createdAt: baseNode?.createdAt || new Date().toISOString(),
+    contentJson: stringifyContent({ ...parseContent(baseNode), chapter: form.chapter, tags: form.tags,
+      blocks, summary: body.slice(0, 80), text: body })
+  }
+  revision = queueNote(account, node, revision)
+  baseNode = node
+  savedForm = snapshot
+  if (legacyKey) {
+    uni.removeStorageSync(legacyKey)
+    legacyKey = ''
+  }
+  return true
 }
 
-/** 附件上传：H5 的 blob: 地址由 uni.uploadFile 自行读取，App 用临时文件路径。 */
-async function uploadLocal(block: NoteBlock): Promise<string> {
-  const src = blockSrc(block)
-  if (!src) throw new Error('附件不可用')
-  return upload(src)
-}
-
-/* ---------- 保存 ---------- */
-async function submit() {
-  if (saving.value) return
-  const title = form.title.trim()
-  if (!title) { toast('给这条感悟起个标题'); return }
-  if (recording.value) stopRecording()
-  saving.value = true
-  const pending = form.blocks.filter(block =>
-    (block.type === 'image' || block.type === 'audio') && !block.url && blockSrc(block))
-  uploadTotal.value = pending.length
-  uploadDone.value = 0
-  saveLabel.value = pending.length ? `上传附件 0/${pending.length}` : '保存中…'
+function saveOnExit(): boolean {
   try {
-    for (const block of pending) {
-      block.url = await uploadLocal(block)
-      uploadDone.value += 1
-      saveLabel.value = `上传附件 ${uploadDone.value}/${uploadTotal.value}`
-    }
-    saveLabel.value = '保存中…'
-    const attachments = form.blocks
-      .filter((block): block is NoteBlock & { type: 'image' | 'audio' } =>
-        (block.type === 'image' || block.type === 'audio') && !!block.url)
-      .map(block => ({ kind: block.type, url: block.url as string }))
-    const content = {
-      chapter: form.chapter,
-      tags: form.tags,
-      blocks: form.blocks,
-      summary: form.blocks.find(block => block.type === 'text')?.text?.slice(0, 80) || '',
-      text: form.blocks.filter(block => block.type === 'text').map(block => block.text).join('\n\n'),
-      attachments
-    }
-    if (editing.value && noteId.value) {
-      const node = await fetchNode(noteId.value)
-      await saveNode({ ...node, title }, stringifyContent(content))
-      toast('已保存')
-      uni.redirectTo({ url: `${ROUTES.note}?id=${noteId.value}` })
-    } else {
-      const created = await saveNode({
-        id: newId(),
-        parentId: parentId.value || null,
-        nodeType: 'note',
-        title,
-        sortOrder: tree.value.filter(node => node.parentId === parentId.value && node.nodeType === 'note').length + 1
-      } as BookNode, stringifyContent(content))
-      clearDraft(store.account.value, currentDraftId())
-      toast('已保存')
-      uni.redirectTo({ url: `${ROUTES.note}?id=${created.id}` })
-    }
-  } catch (failure) {
-    toast(failure instanceof Error ? failure.message : '保存失败，内容已保留')
-  } finally {
-    saving.value = false
-    saveLabel.value = '保存'
+    persistNote()
+    return true
+  } catch {
+    toast('本机保存失败，请检查存储空间后重试')
+    return false
   }
 }
 
-function newId() {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, char => {
-    const digit = Math.floor(Math.random() * 16)
-    return (char === 'x' ? digit : (digit & 3) | 8).toString(16)
-  })
+async function submit() {
+  if (saving.value) return
+  saving.value = true
+  try {
+    stopRecording()
+    await recordCompletion
+    if (!persistNote()) {
+      toast('请先填写感悟')
+      return
+    }
+    toast('已保存到本机')
+    uni.redirectTo({ url: `${ROUTES.note}?id=${noteId.value}` })
+  } catch {
+    toast('本机保存失败，请检查存储空间后重试')
+  } finally {
+    saving.value = false
+  }
 }
 
-let hasLoaded = false
 const loading = ref(true)
 
 async function load() {
   if (!store.token.value) return
-  if (loading.value && hasLoaded) return
-  loading.value = true
-  hasLoaded = true
+  account = store.account.value
   try {
-    tree.value = await fetchNodes({ tree: true })
-    if (editing.value && noteId.value) {
-      const node = await fetchNode(noteId.value)
-      form.title = node.title
-      const content = parseContent(node)
+    if (editing.value) {
+      revision = pendingNote(account, noteId.value)?.revision
+      try {
+        baseNode = await fetchNode(noteId.value)
+      } catch (failure) {
+        if (!(failure instanceof ApiError) || failure.status !== 0) throw failure
+        const cached = await fetchNodes({ tree: true })
+        baseNode = cached.find(node => node.id === noteId.value && node.contentJson !== undefined)
+        if (!baseNode) throw failure
+      }
+      form.title = baseNode.title
+      const content = parseContent(baseNode)
       form.chapter = content.chapter || ''
       form.tags = [...(content.tags || [])]
-      form.blocks = blocksOf(node).length ? [...blocksOf(node)] : [makeBlock('text')]
-      parentId.value = node.parentId || ''
-      bookId.value = node.parentId || ''
-    } else {
-      bookId.value = pageOption('bookId', parentId.value)
-      form.blocks = [makeBlock('text')]
+      form.blocks = blocksOf(baseNode)
+      parentId.value = baseNode.parentId || ''
     }
-    // 有本机草稿时优先恢复（可能来自上次断网或误退）
-    const local = readDraft<{
-      title?: string
-      chapter?: string
-      tags?: string[]
-      blocks?: NoteBlock[]
-      parentId?: string
-    }>(store.account.value, currentDraftId())
-    if (local) {
-      if (local.title !== undefined) form.title = local.title
-      if (local.chapter !== undefined) form.chapter = local.chapter
-      if (Array.isArray(local.tags)) form.tags = [...local.tags]
-      if (Array.isArray(local.blocks) && local.blocks.length) form.blocks = local.blocks
-      if (local.parentId) parentId.value = local.parentId
-      toast('已恢复上次未提交的草稿')
+    if (!parentId.value) throw new Error('找不到这条感悟所属的书本')
+    bookId.value = parentId.value
+    if (!form.blocks.length) form.blocks = [makeBlock('text')]
+    savedForm = JSON.stringify(form)
+
+    // 已有版本留下的内容仅在用户重新进入同一感悟或书本时接续。
+    if (!revision) {
+      const key = `${bookStoragePrefix}-draft:${account}:${editing.value ? noteId.value : 'new:note'}`
+      const old = uni.getStorageSync(key)
+      if (old && typeof old === 'object' && (editing.value || old.parentId === parentId.value)) {
+        if (typeof old.title === 'string') form.title = old.title
+        if (typeof old.chapter === 'string') form.chapter = old.chapter
+        if (Array.isArray(old.tags)) form.tags = old.tags
+        if (Array.isArray(old.blocks) && old.blocks.length) {
+          form.blocks = old.blocks.map(({ localKey, path, ...block }: NoteBlock) => block)
+        }
+        legacyKey = key
+      }
     }
-    draftReady = true
+    ready = account === store.account.value
+    void fetchNodes({ tree: true }).then(rows => { tree.value = rows }).catch(() => undefined)
   } catch (failure) {
     toast(failure instanceof Error ? failure.message : '加载失败')
   } finally {
@@ -489,11 +446,25 @@ async function load() {
 }
 
 onLoad(options => {
-  noteId.value = pageOption('id', (options?.id as string) || '')
+  const id = pageOption('id', (options?.id as string) || '')
+  noteId.value = id || newId()
   parentId.value = pageOption('parentId', (options?.parentId as string) || '')
-  editing.value = Boolean(noteId.value)
+  editing.value = Boolean(id)
   if (requireLogin()) void load()
 })
+
+onBackPress(() => !saveOnExit())
+onHide(saveOnExit)
+onUnload(() => {
+  leftEditor = true
+  stopRecording()
+  saveOnExit()
+  player?.destroy()
+})
+// #ifdef H5
+onMounted(() => window.addEventListener('pagehide', saveOnExit))
+onUnmounted(() => window.removeEventListener('pagehide', saveOnExit))
+// #endif
 </script>
 
 <style scoped>

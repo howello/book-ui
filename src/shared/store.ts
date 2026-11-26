@@ -2,6 +2,7 @@ import { computed, reactive, ref, watch } from 'vue'
 import { bookStoragePrefix, baseApi } from '../api-env'
 import type { BookNode, NodeType } from './types'
 import { parseContent } from './types'
+import { mergePendingNotes, pendingNote, pendingNotes, writePendingNote } from './pending-notes'
 
 /** 节点类型显示名。 */
 export const TYPE_NAMES: Record<NodeType, string> = {
@@ -63,9 +64,12 @@ const account = ref<string>(uni.getStorageSync(accountKey) || '')
 const nodes = ref<BookNode[]>([])
 const loading = ref(false)
 const error = ref('')
+let cacheRevision = 0
+const syncedNotes = new Map<string, { revision: number; node: BookNode }>()
 
 /** 本地缓存键按账号隔离，切换账号不会串数据。 */
-const cacheKey = (path: string) => `${bookStoragePrefix}-cache:${account.value}:${path}`
+const cachePrefix = (owner: string) => `${bookStoragePrefix}-cache:${owner}:`
+const cacheKey = (path: string, owner = account.value) => cachePrefix(owner) + path
 
 /** 统一的接口错误。 */
 export class ApiError extends Error {
@@ -83,6 +87,8 @@ export function request<T>(url: string, method: 'GET' | 'POST' | 'PUT' | 'DELETE
   const api = baseApi()
   if (!api) return Promise.reject(new ApiError('请配置 App 后端地址', 0))
   const requestToken = token.value
+  const owner = account.value
+  const active = () => requestToken === token.value && owner === account.value
   return new Promise<T>((resolve, reject) => {
     uni.request({
       url: api + url,
@@ -91,42 +97,85 @@ export function request<T>(url: string, method: 'GET' | 'POST' | 'PUT' | 'DELETE
       timeout: 20000,
       header: requestToken ? { Authorization: 'Bearer ' + requestToken } : {},
       success(response) {
+        if (!active()) {
+          reject(new ApiError('登录账号已变化', 499))
+          return
+        }
         const result = response.data as { code?: number; msg?: string; data?: T }
         const status = result?.code || response.statusCode
-        if (status === 401 && requestToken === token.value) clearSession()
+        if (status === 401) clearSession()
         if (status !== 200) {
           reject(new ApiError(result?.msg || '请求失败', status))
           return
         }
-        resolve((result.data ?? result) as T)
+        resolve((result?.data ?? result) as T)
       },
       fail() {
-        reject(new ApiError('网络不可用', 0))
+        reject(active() ? new ApiError('网络不可用', 0) : new ApiError('登录账号已变化', 499))
       }
     })
   })
 }
 
-/** 读取列表：在线优先，断网回落到本机缓存。默认带上正文，供列表直接渲染。 */
-export async function fetchNodes(params: { parentId?: string | null; tree?: boolean; withContent?: boolean } = {}): Promise<BookNode[]> {
+interface NodeListOptions {
+  parentId?: string | null
+  tree?: boolean
+  withContent?: boolean
+}
+
+function nodeListPath(params: NodeListOptions) {
   // 不用 URLSearchParams：Android WebView 的旧内核没有这个全局对象
   const search: string[] = []
   if (params.tree) search.push('tree=true')
   else if (params.parentId) search.push('parentId=' + encodeURIComponent(params.parentId))
   if (params.withContent !== false) search.push('withContent=true')
-  const path = '/book/nodes' + (search.length ? '?' + search.join('&') : '')
-  try {
-    const value = await request<BookNode[]>(path)
-    try {
-      uni.setStorageSync(cacheKey(path), value)
-    } catch {
-      // 缓存空间不足不影响在线结果
+  return '/book/nodes' + (search.length ? '?' + search.join('&') : '')
+}
+
+/** 立即读取当前账号的本机列表，并叠加尚未上传的感悟。 */
+export function readCachedNodes(params: NodeListOptions = {}): BookNode[] | undefined {
+  const owner = account.value
+  if (!token.value || !owner) return
+  const cached = uni.getStorageSync(cacheKey(nodeListPath(params), owner))
+  if (Array.isArray(cached)) return mergePendingNotes(owner, cached, params.tree, params.parentId)
+  const local = mergePendingNotes(owner, [], params.tree, params.parentId)
+  if (local.length) return local
+}
+
+/** 刷新列表，远程成功后更新本机缓存。 */
+export async function refreshNodes(params: NodeListOptions = {}): Promise<BookNode[]> {
+  const path = nodeListPath(params)
+  const owner = account.value
+  const key = cacheKey(path, owner)
+  const revision = cacheRevision
+  let value = await request<BookNode[]>(path)
+  if (!Array.isArray(value)) throw new ApiError('列表响应无效', 502)
+  if (revision !== cacheRevision && (params.tree || params.parentId)) {
+    const rows = new Map(value.map(node => [node.id, node]))
+    for (const { revision: savedAt, node } of syncedNotes.values()) {
+      if (savedAt <= revision || (!params.tree && node.parentId !== params.parentId)) continue
+      if ((rows.get(node.id)?.version || 0) >= (node.version || 0)) continue
+      rows.set(node.id, params.withContent === false ? { ...node, contentJson: undefined } : node)
     }
-    return value
+    value = [...rows.values()]
+  }
+  try {
+    uni.setStorageSync(key, value)
+  } catch {
+    // 缓存空间不足不影响在线结果
+  }
+  return mergePendingNotes(owner, value, params.tree, params.parentId)
+}
+
+/** 读取列表：在线优先，断网时读取当前账号的本机缓存。 */
+export async function fetchNodes(params: NodeListOptions = {}): Promise<BookNode[]> {
+  const owner = account.value
+  try {
+    return await refreshNodes(params)
   } catch (failure) {
-    if (failure instanceof ApiError && failure.status === 0 && token.value) {
-      const cached = uni.getStorageSync(cacheKey(path))
-      if (Array.isArray(cached)) return cached as BookNode[]
+    if (failure instanceof ApiError && failure.status === 0 && token.value && owner === account.value) {
+      const cached = readCachedNodes(params)
+      if (cached !== undefined) return cached
       throw new ApiError('联网打开后可离线使用', 0)
     }
     throw failure
@@ -136,17 +185,25 @@ export async function fetchNodes(params: { parentId?: string | null; tree?: bool
 /** 读取节点详情：在线优先，断网回落到本机缓存。 */
 export async function fetchNode(id: string): Promise<BookNode> {
   const path = '/book/nodes/' + id
+  const owner = account.value
+  const key = cacheKey(path, owner)
+  const revision = cacheRevision
+  const local = pendingNote(owner, id)
+  if (local) return local.node
   try {
-    const value = await request<BookNode>(path)
+    let value = await request<BookNode>(path)
+    const synced = syncedNotes.get(id)
+    if (synced && synced.revision > revision && (synced.node.version || 0) > (value.version || 0)) value = synced.node
     try {
-      uni.setStorageSync(cacheKey(path), value)
+      uni.setStorageSync(key, value)
     } catch {
       // 缓存空间不足不影响在线结果
     }
-    return value
+    return pendingNote(owner, id)?.node ?? value
   } catch (failure) {
-    if (failure instanceof ApiError && failure.status === 0 && token.value) {
-      const cached = uni.getStorageSync(cacheKey(path))
+    if (failure instanceof ApiError && failure.status === 404) uni.removeStorageSync(key)
+    if (failure instanceof ApiError && failure.status === 0 && token.value && owner === account.value) {
+      const cached = uni.getStorageSync(key)
       if (cached && typeof cached === 'object') return cached as BookNode
       throw new ApiError('联网打开后可离线使用', 0)
     }
@@ -154,9 +211,55 @@ export async function fetchNode(id: string): Promise<BookNode> {
   }
 }
 
-/** 删除节点及其整个子树，返回被软删除的节点 ID。 */
-export function removeNode(id: string): Promise<string[]> {
-  return request<string[]>('/book/nodes/' + id, 'DELETE')
+/** 后台同步成功后更新已打开的详情及列表缓存。 */
+export function cacheSyncedNote(owner: string, node: BookNode) {
+  if (owner !== account.value) return
+  syncedNotes.set(node.id, { revision: ++cacheRevision, node })
+  uni.setStorageSync(cacheKey('/book/nodes/' + node.id, owner), node)
+  const prefix = cachePrefix(owner) + '/book/nodes?'
+  for (const key of uni.getStorageInfoSync().keys) {
+    if (!key.startsWith(prefix)) continue
+    const params = key.slice(prefix.length).split('&')
+    const tree = params.includes('tree=true')
+    const parentId = params.find(part => part.startsWith('parentId='))?.slice(9)
+    if (!tree && parentId !== encodeURIComponent(node.parentId || '')) continue
+    const rows = uni.getStorageSync(key)
+    if (!Array.isArray(rows)) continue
+    const saved = params.includes('withContent=true') ? node : { ...node, contentJson: undefined }
+    const index = rows.findIndex((row: BookNode) => row.id === node.id)
+    if (index < 0) rows.push(saved)
+    else rows[index] = saved
+    uni.setStorageSync(key, rows)
+  }
+}
+
+/** 删除节点及其后代，同时清除已删除节点的本机数据。 */
+export async function removeNode(id: string): Promise<string[]> {
+  const owner = account.value
+  const local = pendingNote(owner, id)
+  const ids = local && !local.node.version && !local.attempted
+    ? [id]
+    : await request<string[]>('/book/nodes/' + id, 'DELETE')
+  const deleted = new Set(ids)
+  ids.forEach(id => syncedNotes.delete(id))
+  for (const entry of pendingNotes(owner)) {
+    if (deleted.has(entry.node.id) || deleted.has(entry.node.parentId || '')) {
+      deleted.add(entry.node.id)
+      writePendingNote(owner, entry.node.id)
+    }
+  }
+  const prefix = cachePrefix(owner) + '/book/nodes'
+  for (const key of uni.getStorageInfoSync().keys) {
+    if (!key.startsWith(prefix)) continue
+    const suffix = key.slice(prefix.length)
+    if (suffix.startsWith('/')) {
+      if (deleted.has(suffix.slice(1))) uni.removeStorageSync(key)
+    } else {
+      const cached = uni.getStorageSync(key)
+      if (Array.isArray(cached)) uni.setStorageSync(key, cached.filter(row => !deleted.has(row.id)))
+    }
+  }
+  return [...deleted]
 }
 
 /**
@@ -195,6 +298,7 @@ export async function hydrate(nodes: BookNode[], limit = 6): Promise<BookNode[]>
 /** 清除本机会话与内存状态。 */
 export function clearSession() {
   detailCache.clear()
+  syncedNotes.clear()
   token.value = ''
 
   account.value = ''

@@ -269,7 +269,7 @@ async function removeBook() {
   const confirmed = await new Promise<boolean>(resolve => {
     uni.showModal({
       title: `删除《${node.title}》？`,
-      content: notes ? `${notes} 条感悟及其备注会一并进入回收站` : '删除后可在回收站恢复',
+      content: notes ? `${notes} 条感悟及其备注会一并删除` : '删除后无法恢复',
       confirmText: '确认删除',
       success: result => resolve(result.confirm),
       fail: () => resolve(false)
@@ -278,7 +278,7 @@ async function removeBook() {
   if (!confirmed) return
   try {
     await removeNode(node.id)
-    toast('已移入回收站')
+    toast('已删除')
     await load()
   } catch (failure) {
     toast(failure instanceof Error ? failure.message : '删除失败')
@@ -291,7 +291,7 @@ async function removeCategory() {
   const confirmed = await new Promise<boolean>(resolve => {
     uni.showModal({
       title: `删除「${category.value?.title}」？`,
-      content: books.value.length ? `分类下还有 ${books.value.length} 本书，会一并进入回收站` : '删除后可在回收站恢复',
+      content: books.value.length ? `分类下还有 ${books.value.length} 本书，会一并删除` : '删除后无法恢复',
       confirmText: '确认删除',
       success: result => resolve(result.confirm),
       fail: () => resolve(false)
@@ -300,7 +300,7 @@ async function removeCategory() {
   if (!confirmed) return
   try {
     await removeNode(categoryId.value)
-    toast('已移入回收站')
+    toast('已删除')
     goHome()
   } catch (failure) {
     toast(failure instanceof Error ? failure.message : '删除失败')
