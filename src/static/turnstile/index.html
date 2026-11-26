@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="no-referrer">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; connect-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+    <title>人机校验</title>
+    <style>
+      body { margin: 0; padding: 4px 0; font: 14px system-ui, sans-serif; color-scheme: light; background: #fff; color: #222; }
+      body.native { padding: 24px; }
+      #status { margin: 4px 0; }
+    </style>
+    <script src="./widget.js" defer></script>
+  </head>
+  <body>
+    <div id="challenge"></div>
+    <p id="status" role="status">正在加载人机校验</p>
+    <button id="retry" type="button" hidden>重试</button>
+  </body>
+</html>
