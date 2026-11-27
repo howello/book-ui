@@ -7,8 +7,10 @@
     </template>
     <template #path>
       <text class="link" @click="goHome">我的书架</text>
-      <text class="sep">/</text>
-      <text class="link" @click="openCategory">{{ category?.title || '分类' }}</text>
+      <template v-for="ancestor in categoryPath" :key="ancestor.id">
+        <text class="sep">/</text>
+        <text class="link" @click="openCategory(ancestor.id)">{{ ancestor.title }}</text>
+      </template>
       <text class="sep">/</text>
       <text class="cur">{{ book?.title || '书本' }}</text>
     </template>
@@ -98,14 +100,13 @@
       <text v-if="visibleNotes.length" class="tiny list-tail">已经到底了</text>
     </scroll-view>
 
-
-
     <template #footer>
-      <AppTabbar current="shelf" />
-      <!-- 写感悟：右下角圆形悬浮按钮，只有 + 图标 -->
-      <button class="fab-round" aria-label="写一条感悟" @click="writeNote">
-        <AppIcon name="plus" :size="24" />
-      </button>
+      <view class="book-footer">
+        <AppTabbar current="shelf" />
+        <button class="fab-round" aria-label="写一条感悟" @click="writeNote">
+          <AppIcon name="plus" :size="24" />
+        </button>
+      </view>
     </template>
     <AppToast />
 </AppPage>
@@ -122,7 +123,7 @@ import AppTabbar from '../../components/AppTabbar.vue'
 import SortMenu from '../../components/SortMenu.vue'
 import { contentCover, coverImage, coverPalette } from '../../shared/covers'
 import { ROUTES, goHome } from '../../shared/navigation'
-import { childCount, fetchNodes, useBookStore } from '../../shared/store'
+import { ancestorsOf, fetchNodePage, fetchSubtree, useBookStore } from '../../shared/store'
 import type { BookNode } from '../../shared/types'
 import { parseContent } from '../../shared/types'
 import { noteStats, pageOption, requireLogin } from '../../shared/use-book'
@@ -138,7 +139,7 @@ const filter = ref<'all' | 'chapter' | 'image' | 'audio'>('all')
 
 const book = computed(() => tree.value.find(node => node.id === bookId.value))
 const content = computed(() => parseContent(book.value))
-const category = computed(() => tree.value.find(node => node.id === book.value?.parentId))
+const categoryPath = computed(() => ancestorsOf(tree.value, bookId.value).reverse())
 const palette = computed(() => coverPalette(contentCover(content.value).color))
 
 const notes = computed(() => tree.value
@@ -225,22 +226,7 @@ function statsOf(note: BookNode) {
 
 /** 感悟下的备注总数（含所有层级的子备注）。 */
 function remarkCountOf(note: BookNode) {
-  const groups = new Map<string, BookNode[]>()
-  for (const node of tree.value) {
-    const key = node.parentId || ''
-    const group = groups.get(key) || []
-    group.push(node)
-    groups.set(key, group)
-  }
-  let total = 0
-  const walk = (id: string) => {
-    for (const child of groups.get(id) || []) {
-      if (child.nodeType === 'remark') total += 1
-      walk(child.id)
-    }
-  }
-  walk(note.id)
-  return total
+  return note.childCount ?? 0
 }
 
 function dateOf(note: BookNode) {
@@ -253,17 +239,23 @@ function openNote(note: BookNode) {
   uni.navigateTo({ url: `${ROUTES.note}?id=${note.id}` })
 }
 
-function openCategory() {
-  if (category.value) uni.navigateTo({ url: `${ROUTES.category}?id=${category.value.id}` })
-  else goHome()
+function openCategory(id: string) {
+  const pages = getCurrentPages()
+  const previous = pages[pages.length - 2] as { route?: string; options?: Record<string, string> } | undefined
+  if (previous?.route === ROUTES.category.slice(1) && previous.options?.id === id) uni.navigateBack()
+  else uni.redirectTo({ url: `${ROUTES.category}?id=${id}` })
 }
 
 /** 导出整本书的感悟与备注为 Markdown。 */
-function exportBook() {
-  if (!book.value) return
-  const markdown = bookMarkdown(book.value, tree.value)
-  saveMarkdown(`${book.value.title}.md`, markdown)
-  toast(`已导出《${book.value.title}》`)
+async function exportBook() {
+  const node = book.value
+  if (!node) return
+  try {
+    saveMarkdown(`${node.title}.md`, bookMarkdown(node, await fetchSubtree(node.id)))
+    toast(`已导出《${node.title}》`)
+  } catch (failure) {
+    toast(failure instanceof Error ? failure.message : '导出失败')
+  }
 }
 
 function editBook() {
@@ -279,7 +271,7 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    tree.value = await fetchNodes({ tree: true })
+    tree.value = await fetchNodePage(bookId.value, rows => { tree.value = rows; loading.value = false })
   } catch (failure) {
     error.value = failure instanceof Error ? failure.message : '加载失败'
   } finally {
@@ -303,7 +295,7 @@ onShow(() => {
 .scroll {
   flex: 1;
   min-height: 0;
-  padding: 0 0 88px;
+  padding: 0;
   box-sizing: border-box;
 }
 
@@ -373,13 +365,21 @@ onShow(() => {
 .entry .chapter { color: var(--wood-600); }
 .entry .chip { display: inline-flex; align-items: center; gap: 4px; }
 
-.list-tail { display: block; text-align: center; padding: 18px 0 6px; }
+.list-tail {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-height: 74px;
+  padding: 8px 76px 8px 16px;
+}
+.book-footer { position: relative; flex-shrink: 0; }
 
 /* 右下角圆形悬浮按钮：只放 + 图标 */
 .fab-round {
-  position: fixed;
+  position: absolute;
   right: 18px;
-  bottom: calc(54px + env(safe-area-inset-bottom) + 18px);
+  bottom: calc(100% + 18px);
   z-index: 26;
   width: 56px;
   height: 56px;

@@ -59,9 +59,9 @@
             <view class="foot-btn" @click="reply(child)"><AppIcon name="corner" :size="12" /><text>回复</text></view>
             <view class="foot-btn" @click="openRemark(child)"><AppIcon name="layers" :size="12" /><text>进入这一层</text></view>
           </view>
-          <view v-if="grandchildrenOf(child).length" class="child-tail" @click="openRemark(child)">
+          <view v-if="child.childCount" class="child-tail" @click="openRemark(child)">
             <AppIcon name="corner" :size="12" />
-            <text>{{ grandchildrenOf(child).length }} 条子备注 · 进入第 {{ depth + 1 }} 层</text>
+            <text>{{ child.childCount }} 条子备注 · 进入第 {{ depth + 1 }} 层</text>
           </view>
         </view>
 
@@ -109,7 +109,7 @@ import AppIcon from '../../components/AppIcon.vue'
 import SortMenu from '../../components/SortMenu.vue'
 import AppSheet from '../../components/AppSheet.vue'
 import { ROUTES, goHome } from '../../shared/navigation'
-import { ancestorsOf, fetchNodes, removeNode, useBookStore } from '../../shared/store'
+import { ancestorsOf, fetchNodePage, removeNode, useBookStore } from '../../shared/store'
 import type { BookNode } from '../../shared/types'
 import { parseContent } from '../../shared/types'
 import { pageOption, requireLogin, saveNode } from '../../shared/use-book'
@@ -177,10 +177,6 @@ function bodyOf(node: BookNode) {
 function timeOf(node: BookNode) {
   const time = node.createdAt || node.updatedAt || ''
   return time ? time.slice(5, 16).replace('T', ' ') : ''
-}
-
-function grandchildrenOf(node: BookNode) {
-  return tree.value.filter(item => item.parentId === node.id && item.nodeType === 'remark')
 }
 
 function openRemark(node: BookNode) {
@@ -273,7 +269,7 @@ async function load() {
   loading.value = true
   hasLoaded = true
   try {
-    tree.value = await fetchNodes({ tree: true })
+    tree.value = await fetchNodePage(remarkId.value, rows => { tree.value = rows; loading.value = false })
     if (!remark.value && remarkId.value) error.value = '备注不存在或已删除'
   } catch (failure) {
     error.value = failure instanceof Error ? failure.message : '加载失败'

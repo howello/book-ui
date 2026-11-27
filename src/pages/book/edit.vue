@@ -115,9 +115,8 @@
         <view class="between">
           <view>
             <text class="row-title">所属分类</text>
-            <text class="tiny">{{ categoryName || '未归入分类' }}</text>
           </view>
-          <button class="btn xs line" @click="chooseCategory">切换</button>
+          <CategoryPicker v-model="form.parentId" label="所属分类" />
         </view>
       </view>
 
@@ -153,18 +152,19 @@ import { computed, reactive, ref } from 'vue'
 import { onLoad } from '@dcloudio/uni-app'
 import AppPage from '../../components/AppPage.vue'
 import AppToast from '../../components/AppToast.vue'
-import { baseApi } from '../../api-env'
 import AppIcon from '../../components/AppIcon.vue'
 import AppSheet from '../../components/AppSheet.vue'
+import CategoryPicker from '../../components/CategoryPicker.vue'
 import CoverFace from '../../components/CoverFace.vue'
 import CoverFinder from '../../components/CoverFinder.vue'
 import { contentCover, libraryCoverUrl, randomLibraryCover } from '../../shared/covers'
 import { ROUTES, goBack } from '../../shared/navigation'
-import { fetchNodes, removeNode, useBookStore } from '../../shared/store'
+import { fetchNodePage, removeNode, useBookStore } from '../../shared/store'
 import type { BookNode } from '../../shared/types'
 import { parseContent, stringifyContent } from '../../shared/types'
-import { importCover, pageOption, requireLogin, saveNode } from '../../shared/use-book'
+import { pageOption, requireLogin, saveNode } from '../../shared/use-book'
 import { toast } from '../../shared/toast'
+import { keepNoteMedia } from '../../shared/media'
 
 const store = useBookStore()
 const bookId = ref('')
@@ -197,11 +197,11 @@ const form = reactive({
   /** 图库封面相对路径（保存时不转存） */
   libraryRef: '' as string,
   /** 检索到的在线封面，保存时转存 */
-  externalCover: ''
+  externalCover: '',
+  localCoverKey: ''
 })
 
 const book = computed(() => tree.value.find(node => node.id === bookId.value))
-const categoryName = computed(() => tree.value.find(node => node.id === form.parentId)?.title || '')
 const statusIndex = computed(() => Math.max(0, statuses.indexOf(form.status)))
 const ratingHint = computed(() => {
   const value = Number(form.rating)
@@ -211,28 +211,20 @@ const ratingHint = computed(() => {
 
 /** 封面预览：已上传图片优先，否则用配色绘制。 */
 const previewImage = computed(() =>
-  libraryCoverUrl(form.libraryRef) ||
-  form.externalCover ||
-  (form.coverKind === 'public' ? form.coverRef : ''))
+  (form.localCoverKey ? 'book-local-media:' + form.localCoverKey : '') ||
+  form.externalCover || libraryCoverUrl(form.libraryRef) ||
+  (['public', 'external'].includes(form.coverKind) ? form.coverRef : ''))
 
 /** 随机换一张图库封面（与分类共用图库）。 */
 function shuffleCover() {
   form.libraryRef = randomLibraryCover(form.libraryRef)
+  form.localCoverKey = ''
+  form.externalCover = ''
   form.externalCover = ''
 }
 
 const noteTotal = computed(() => tree.value.filter(node => node.parentId === bookId.value && node.nodeType === 'note').length)
-const remarkTotal = computed(() => {
-  let total = 0
-  const walk = (id: string) => {
-    for (const node of tree.value.filter(item => item.parentId === id)) {
-      if (node.nodeType === 'remark') total += 1
-      walk(node.id)
-    }
-  }
-  walk(bookId.value)
-  return total
-})
+const remarkTotal = computed(() => tree.value.filter(node => node.parentId === bookId.value).reduce((count, note) => count + (note.childCount || 0), 0))
 
 function onStatusChange(event: { detail: { value: string | number } }) {
   form.status = statuses[Number(event.detail.value)] || form.status
@@ -254,18 +246,6 @@ function addTag() {
   })
 }
 
-function chooseCategory() {
-  const targets = tree.value.filter(node => node.nodeType === 'category')
-  if (!targets.length) { toast('没有可选的分类'); return }
-  uni.showActionSheet({
-    itemList: targets.map(node => node.title),
-    success: result => {
-      const target = targets[result.tapIndex]
-      if (target) form.parentId = target.id
-    }
-  })
-}
-
 function openFinder() {
   finderOpen.value = true
 }
@@ -274,7 +254,7 @@ function openFinder() {
 function applyPick(pick: { color: string; art: string; title?: string; author?: string; year?: string; publisher?: string; cover?: string; coverOnly?: boolean }) {
   form.color = pick.color
   form.art = pick.art
-  if (pick.cover) form.externalCover = pick.cover
+  if (pick.cover) { form.externalCover = pick.cover; form.localCoverKey = ''; form.libraryRef = '' }
   if (pick.coverOnly) { toast('已套用封面，其余信息保持不变'); return }
   if (pick.title) form.title = pick.title
   if (pick.author) form.author = pick.author
@@ -293,11 +273,10 @@ function pickCover() {
       if (!path) return
       uploading.value = true
       try {
-        const url = await upload(path)
-        form.coverKind = 'public'
-        form.coverRef = url
+        form.localCoverKey = await keepNoteMedia(store.account.value, path)
         form.externalCover = ''
-        toast('封面已上传，保存后生效')
+        form.libraryRef = ''
+        toast('已保存图片，联网后同步')
       } catch (failure) {
         toast(failure instanceof Error ? failure.message : '封面上传失败')
       } finally {
@@ -307,54 +286,16 @@ function pickCover() {
   })
 }
 
-/** 上传单个文件到共享媒体接口，返回可访问地址。 */
-function upload(path: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    uni.uploadFile({
-      url: baseApi() + '/common/upload',
-      filePath: path,
-      name: 'file',
-      header: { Authorization: 'Bearer ' + store.token.value },
-      success: response => {
-        try {
-          const body = JSON.parse(response.data) as { code?: number; url?: string; msg?: string }
-          if (response.statusCode === 200 && body.code === 200 && body.url) resolve(body.url)
-          else reject(new Error(body.msg || '上传失败'))
-        } catch {
-          reject(new Error('上传失败'))
-        }
-      },
-      fail: () => reject(new Error('上传失败'))
-    })
-  })
-}
-
 async function submit() {
   const node = book.value
   if (!node || saving.value) return
   if (!form.title.trim()) { toast('请填写书名'); return }
   saving.value = true
   try {
-    // 采用在线封面时先转存到共享媒体存储，避免外链失效或防盗链
-    let coverKind = form.coverKind || 'theme'
-    let coverRef = form.coverRef || null
-    if (form.libraryRef) {
-      coverKind = 'local'
-      coverRef = form.libraryRef
-    }
-    if (form.externalCover) {
-      try {
-        coverRef = await importCover(form.externalCover)
-        coverKind = 'public'
-        form.coverKind = coverKind
-        form.coverRef = coverRef
-        form.externalCover = ''
-      } catch (failure) {
-        toast(failure instanceof Error ? failure.message : '封面转存失败，已改用配色封面')
-        coverKind = 'theme'
-        coverRef = null
-      }
-    }
+    const coverKind = form.libraryRef ? 'local' : form.coverKind || 'theme'
+    const coverRef = form.libraryRef || form.coverRef || null
+    const pendingCover = form.localCoverKey ? { localKey: form.localCoverKey }
+      : form.externalCover ? { remoteUrl: form.externalCover } : undefined
     const source = parseContent(node)
     const content = stringifyContent({
       ...source,
@@ -377,7 +318,8 @@ async function submit() {
       title: form.title.trim(),
       parentId: form.parentId,
       coverKind,
-      coverRef
+      coverRef,
+      pendingCover
     }, content)
     toast('已保存书本信息')
     goBack()
@@ -414,7 +356,7 @@ async function load() {
   loading.value = true
   hasLoaded = true
   try {
-    tree.value = await fetchNodes({ tree: true })
+    tree.value = await fetchNodePage(bookId.value)
     const node = book.value
     if (!node) { toast('书本不存在或已删除'); return }
     const content = parseContent(node)
@@ -435,7 +377,8 @@ async function load() {
     form.parentId = node.parentId || null
     form.coverKind = node.coverKind || ''
     form.coverRef = node.coverRef || ''
-    form.externalCover = ''
+    form.externalCover = node.pendingCover?.remoteUrl || ''
+    form.localCoverKey = node.pendingCover?.localKey || ''
     form.libraryRef = node.coverKind === 'local' ? node.coverRef || '' : ''
   } catch (failure) {
     toast(failure instanceof Error ? failure.message : '加载失败')

@@ -78,6 +78,8 @@ const mediaPrefix = bookStoragePrefix + '-media:'
  * local → 随包静态封面；external → 检索到的在线封面（保存前预览）。
  */
 export function coverImage(node?: BookNode | null): string {
+  if (node?.pendingCover?.localKey) return 'book-local-media:' + node.pendingCover.localKey
+  if (node?.pendingCover?.remoteUrl) return node.pendingCover.remoteUrl
   if (!node?.coverKind || !node.coverRef) return ''
   if (node.coverKind === 'public') {
     const cached = uni.getStorageSync(mediaPrefix + node.coverRef)

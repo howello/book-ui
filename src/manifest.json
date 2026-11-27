@@ -6,7 +6,8 @@
     "app-plus" : {
         "modules" : {
             "Camera" : {},
-            "Record" : {}
+            "Record" : {},
+            "SQLite" : {}
         },
         "distribute" : {
             "android" : {

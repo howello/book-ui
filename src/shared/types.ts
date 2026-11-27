@@ -73,6 +73,9 @@ export interface BookNode {
   createdAt?: string
   updatedAt?: string
   deletedAt?: string | null
+  childCount?: number
+  cacheVersion?: string
+  pendingCover?: { remoteUrl?: string; localKey?: string }
 }
 
 /** 解析节点正文，坏 JSON 一律回退为空对象。 */
