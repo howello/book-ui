@@ -84,9 +84,16 @@
     }
   ],
   "globalStyle": {
-    "navigationBarTextStyle": "black",
     "navigationBarTitleText": "悟",
+    // #ifdef APP-PLUS
+    "navigationBarTextStyle": "@navigationText",
+    "navigationBarBackgroundColor": "@pageBackground",
+    "backgroundColor": "@pageBackground"
+    // #endif
+    // #ifndef APP-PLUS
+    "navigationBarTextStyle": "black",
     "navigationBarBackgroundColor": "#F6F1E7",
     "backgroundColor": "#F6F1E7"
+    // #endif
   }
 }

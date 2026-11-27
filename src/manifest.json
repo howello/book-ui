@@ -4,6 +4,8 @@
     "versionName" : "1.0.4",
     "versionCode" : "104",
     "app-plus" : {
+        "darkmode" : true,
+        "themeLocation" : "theme.json",
         "modules" : {
             "Camera" : {},
             "Record" : {},

@@ -171,6 +171,8 @@ export interface CatalogItem {
   tags?: string
   cover?: string
   source?: string
+  bookId?: string
+  searchToken?: string
 }
 
 /** 检索配图。 */
@@ -183,6 +185,12 @@ export interface ImageItem {
 /** 书目检索：失败时保留可手填状态。source 取 douban-book / douban-read / weread。 */
 export async function searchCatalog(query: string, source = 'douban-book'): Promise<CatalogItem[]> {
   return request<CatalogItem[]>('/book/search/catalog?q=' + encodeURIComponent(query) + '&source=' + encodeURIComponent(source))
+}
+
+/** 读取微信读书候选的完整书目。 */
+export function fetchWeReadBook(bookId: string, searchToken: string) {
+  return request<CatalogItem>('/book/search/weread-book?bookId=' + encodeURIComponent(bookId)
+    + '&searchToken=' + encodeURIComponent(searchToken))
 }
 
 /** 配图检索：source 取 auto / bing / so360。 */
