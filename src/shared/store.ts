@@ -4,7 +4,7 @@ import type { BookNode, NodeType } from './types'
 import { parseContent } from './types'
 import { clearCacheRecords, listCache, readCache, writeCache, writeCacheBatch } from './cache-db'
 import { clearScopeMedia, rememberScopeMedia } from './scope-media'
-import { pendingNote, pendingNotes, restorePendingNotes, writePendingNote } from './pending-notes'
+import { pendingNote, pendingNotes, restorePendingNotes, writePendingNote, type PendingNote } from './pending-notes'
 
 /** 节点类型显示名。 */
 export const TYPE_NAMES: Record<NodeType, string> = {
@@ -396,8 +396,59 @@ export async function removeNode(id: string): Promise<string[]> {
   return ids
 }
 
-export async function cachedScopeCount(owner: string) {
-  return (await listCache<BookNode[]>(storagePrefix(owner) + 'scope:').catch(() => [])).length
+export type OfflineNode = Pick<BookNode, 'id' | 'parentId' | 'nodeType'>
+
+/** 仅读取当前账号已经保存在本机的节点，合并分层快照、独立详情和旧版缓存。 */
+export async function readOfflineNodes(owner: string): Promise<OfflineNode[]> {
+  if (!owner) return []
+  const [scopes, details] = await Promise.all([
+    listCache<BookNode[]>(storagePrefix(owner) + 'scope:').catch(() => []),
+    listCache<BookNode>(storagePrefix(owner) + 'node:').catch(() => []),
+    restorePendingNotes(owner)
+  ])
+  const nodes = new Map<string, OfflineNode>()
+  const add = (node: BookNode) => {
+    if (node.deletedAt) nodes.delete(node.id)
+    else nodes.set(node.id, { id: node.id, parentId: node.parentId, nodeType: node.nodeType })
+  }
+  const legacy = uni.getStorageSync(cacheKey('/book/nodes?tree=true&withContent=true', owner))
+  if (Array.isArray(legacy)) (legacy as BookNode[]).forEach(add)
+  const legacyDetailPrefix = cacheKey('/book/nodes/', owner)
+  for (const key of uni.getStorageInfoSync().keys) {
+    if (!key.startsWith(legacyDetailPrefix)) continue
+    const id = key.slice(legacyDetailPrefix.length)
+    const node = uni.getStorageSync(key) as BookNode | undefined
+    if (id && node?.id === id) add(node)
+  }
+  for (const [, rows] of scopes) rows.forEach(add)
+  for (const [, node] of details) add(node)
+  return [...nodes.values()]
+}
+
+/** 本机新增和修改计入数量，待删除的节点及其下级从统计中扣除。 */
+export function countOfflineNodes(rows: OfflineNode[], pending: PendingNote[]) {
+  const nodes = new Map(rows.map(node => [node.id, node]))
+  const deleted = new Set<string>()
+  for (const entry of pending) {
+    if (entry.operation === 'delete') deleted.add(entry.node.id)
+    else nodes.set(entry.node.id, entry.node)
+  }
+  if (deleted.size) {
+    const children = new Map<string, string[]>()
+    for (const node of nodes.values()) {
+      if (!node.parentId) continue
+      const siblings = children.get(node.parentId) || []
+      siblings.push(node.id)
+      children.set(node.parentId, siblings)
+    }
+    for (const id of deleted) {
+      nodes.delete(id)
+      for (const child of children.get(id) || []) deleted.add(child)
+    }
+  }
+  const counts: Record<NodeType, number> = { category: 0, book: 0, note: 0, remark: 0 }
+  for (const node of nodes.values()) counts[node.nodeType]++
+  return counts
 }
 
 export async function clearOfflineCache(owner: string) {
@@ -788,44 +839,68 @@ export function pathIds(list: BookNode[], id: string): string[] {
 /** 响应式主题：浅色 / 深色 / 跟随系统。 */
 const themeKey = bookStoragePrefix + '-theme'
 const themeIndex = ref<number>(uni.getStorageSync(themeKey) || 0)
-
-/** 跟随系统时监听 prefers-color-scheme，手动模式保持用户选择。 */
 const systemDark = ref(false)
+const activeTheme = computed(() => {
+  if (themeIndex.value === 2) return 'dark'
+  if (themeIndex.value === 1) return 'light'
+  return systemDark.value ? 'dark' : 'light'
+})
 // #ifdef H5
-if (typeof window !== 'undefined' && window.matchMedia) {
-  const query = window.matchMedia('(prefers-color-scheme: dark)')
-  systemDark.value = query.matches
-  query.addEventListener?.('change', event => { systemDark.value = event.matches })
-}
+const systemColors = typeof window !== 'undefined' ? window.matchMedia?.('(prefers-color-scheme: dark)') : undefined
 // #endif
 
-/** 把主题写到 <html data-theme>，让 body 底色与表单控件一起跟随。 */
-function applyTheme() {
+/** 从浏览器或系统刷新当前配色，App 回到前台时也会重新读取。 */
+export function refreshSystemTheme() {
   // #ifdef H5
-  if (typeof document !== 'undefined') {
-    const dark = themeIndex.value === 2 || (themeIndex.value === 0 && systemDark.value)
-    document.documentElement.dataset.theme = dark ? 'dark' : 'light'
+  systemDark.value = systemColors?.matches ?? false
+  // #endif
+  // #ifdef APP-PLUS
+  if (themeIndex.value === 0) {
+    const info = uni.getSystemInfoSync()
+    const system = info.osTheme === 'light' || info.osTheme === 'dark' ? info.osTheme : info.theme
+    if (system === 'light' || system === 'dark') systemDark.value = system === 'dark'
   }
+  // #endif
+}
+
+/** App 原生界面使用与页面一致的外观，跟随系统时开启原生配色监听。 */
+function applyNativeTheme() {
+  // #ifdef APP-PLUS
+  if (typeof plus !== 'undefined') {
+    plus.nativeUI?.setUIStyle?.(themeIndex.value === 0 ? 'auto' : activeTheme.value)
+  }
+  // #endif
+}
+
+/** 启动时读取系统外观，并为应用生命周期注册一次主题监听。 */
+export function initTheme() {
+  applyNativeTheme()
+  refreshSystemTheme()
+  // #ifdef H5
+  if (systemColors?.addEventListener) systemColors.addEventListener('change', refreshSystemTheme)
+  else systemColors?.addListener(refreshSystemTheme)
+  watch(activeTheme, value => {
+    document.documentElement.dataset.theme = value
+  }, { immediate: true })
+  // #endif
+  // #ifdef APP-PLUS
+  uni.onThemeChange?.(event => {
+    if (themeIndex.value === 0) systemDark.value = event.theme === 'dark'
+  })
   // #endif
 }
 
 /** 主题状态。 */
 export function useTheme() {
-  const theme = computed(() => {
-    if (themeIndex.value === 2) return 'dark'
-    if (themeIndex.value === 1) return 'light'
-    return systemDark.value ? 'dark' : 'light'
-  })
-  applyTheme()
-  watch(theme, applyTheme)
   return reactive({
-    theme,
-    index: computed(() => themeIndex.value),
+    theme: activeTheme,
+    index: themeIndex,
     labels: ['跟随系统', '浅色', '深色'],
     set(index: number) {
       themeIndex.value = Math.max(0, Math.min(2, index))
       uni.setStorageSync(themeKey, themeIndex.value)
-      applyTheme()
+      applyNativeTheme()
+      refreshSystemTheme()
     }
   })
 }

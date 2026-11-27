@@ -53,8 +53,8 @@
           <text v-if="item.summary" class="fd-p fd-summary">{{ item.summary.slice(0, 80) }}</text>
         </view>
         <view class="fd-acts">
-          <button class="fd-use" @click="useBook(item)">用这本</button>
-          <button v-if="item.cover" class="fd-cover" @click="useCover(item)">仅封面</button>
+          <button class="fd-use" :disabled="selecting" @click="useBook(item)">用这本</button>
+          <button v-if="item.cover" class="fd-cover" :disabled="selecting" @click="useCover(item)">仅封面</button>
         </view>
       </view>
     </view>
@@ -85,8 +85,9 @@ import AppIcon from './AppIcon.vue'
 import CoverFace from './CoverFace.vue'
 import AppImage from './AppImage.vue'
 import { ART_KEYS, COVER_KEYS } from '../shared/covers'
-import { searchCatalog, searchImages } from '../shared/use-book'
+import { fetchWeReadBook, searchCatalog, searchImages } from '../shared/use-book'
 import type { CatalogItem, ImageItem } from '../shared/use-book'
+import { toast } from '../shared/toast'
 
 /**
  * 素材查找面板：books 按书名查书目，themes 按关键词查配图。
@@ -156,6 +157,7 @@ function changeSource(event: { detail: { value: string | number } }) {
 
 const keyword = ref('')
 const loading = ref(false)
+const selecting = ref(false)
 const status = ref('')
 const books = ref<CatalogItem[]>([])
 const images = ref<ImageItem[]>([])
@@ -183,6 +185,7 @@ function paletteFor(index: number) {
 watch(() => props.modelValue, value => {
   sequence++
   loading.value = false
+  selecting.value = false
   if (!value) return
   sourceIndex.value = 0
   keyword.value = props.query || ''
@@ -195,6 +198,7 @@ watch(() => props.modelValue, value => {
 async function search() {
   const current = ++sequence
   loading.value = false
+  selecting.value = false
   books.value = []
   images.value = []
   empty.value = false
@@ -241,23 +245,42 @@ function pickWord(word: string) {
 }
 
 /** 「用这本」：回填全部书目字段。 */
-function useBook(item: CatalogItem) {
+async function useBook(item: CatalogItem) {
   const index = books.value.indexOf(item)
   const palette = paletteFor(index < 0 ? 0 : index)
+  const current = sequence
+  let info = item
+  if (item.bookId && item.searchToken) {
+    selecting.value = true
+    status.value = '正在读取微信读书详情…'
+    try {
+      const details = await fetchWeReadBook(item.bookId, item.searchToken)
+      if (current !== sequence) return
+      info = { ...item }
+      for (const key of Object.keys(details) as (keyof CatalogItem)[]) {
+        if (details[key]) info[key] = details[key]
+      }
+    } catch {
+      if (current !== sequence) return
+      toast('详情暂不可用，已采用搜索结果')
+    } finally {
+      if (current === sequence) selecting.value = false
+    }
+  }
   emit('pick', {
     color: palette.color,
     art: palette.art,
-    title: item.title,
-    author: item.author,
-    year: item.year,
-    publisher: item.publisher,
-    translator: item.translator,
-    pages: item.pages,
-    isbn: item.isbn,
-    summary: item.summary,
-    rating: item.rating,
-    tags: item.tags,
-    cover: item.cover
+    title: info.title,
+    author: info.author,
+    year: info.year,
+    publisher: info.publisher,
+    translator: info.translator,
+    pages: info.pages,
+    isbn: info.isbn,
+    summary: info.summary,
+    rating: info.rating,
+    tags: info.tags,
+    cover: info.cover
   })
   open.value = false
 }

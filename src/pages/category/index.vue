@@ -1,12 +1,7 @@
 <template>
-  <AppPage :loading="loading" skeleton="shelf" :shelf-columns="perRow" :title="category?.title || '分类'" :subtitle="subtitle" :before-back="backToParent" back>
+  <AppPage class="category-page" :loading="loading" skeleton="shelf" :shelf-columns="perRow" :title="category?.title || '分类'" :subtitle="subtitle" :before-back="backToParent" back>
     <template #action>
-      <view class="category-actions">
-        <SortMenu :options="sortOptions" :index="sortIndex" @change="setSort" />
-        <button v-if="category" class="act" aria-label="分类操作" @click="moreOpen = true">
-          <AppIcon name="more" :size="18" />
-        </button>
-      </view>
+      <SortMenu :options="sortOptions" :index="sortIndex" @change="setSort" />
     </template>
     <template #path>
       <text class="link" @click="goHome">我的书架</text>
@@ -20,67 +15,47 @@
 
     <scroll-view class="scroll" scroll-y>
       <view v-if="error" class="error-tip">{{ error }}</view>
-      <view v-if="category" class="subcategories">
-        <view class="subcategories-heading">
-          <text>子分类</text>
-          <button class="btn line xs" @click="openSubcategoryForm">新建子分类</button>
-        </view>
-        <button v-for="child in subcategories" :key="child.id" class="subcategory" @click="openCategory(child.id)">
-          <AppIcon name="folder" :size="17" />
-          <text class="subcategory-title">{{ child.title }}</text>
-          <AppIcon name="chev" :size="14" />
-        </button>
-      </view>
-      <view v-if="!loading" class="shelf">
-        <template v-for="(group, rowIndex) in shelfRows" :key="rowIndex">
-          <view class="shelf-row" :style="{ gridTemplateColumns: 'repeat(' + perRow + ', minmax(0, 1fr))' }">
-            <button
-              v-for="item in group"
-              :key="item.key"
-              class="book"
-              @click="item.add ? openCreate() : openBook(item.node!)"
-              @touchstart="item.node && press.onTouchStart($event, () => openMenu(item.node!))"
-              @touchmove="press.onTouchMove"
-              @touchend="press.onTouchEnd"
-              @touchcancel="press.onTouchEnd"
-            >
-              <template v-if="item.add">
-                <view class="add-tile">
-                  <AppIcon name="plus" :size="22" />
-                  <text>添加书本</text>
-                </view>
-              </template>
-              <template v-else>
-                <view class="cover-wrap">
-                  <BookCover
-                    :title="item.node!.title"
-                    :author="authorOf(item.node!)"
-                    :color="paletteOf(item.node!).color"
-                    :art="paletteOf(item.node!).art"
-                    :image="coverImage(item.node!)"
-                    :ribbon="inProgress(item.node!)"
-                  />
-                  <view v-if="menuNode?.id === item.node!.id && menuOpen" class="longpress-hint" />
-                  <!-- 书名与作者压在封面下部，半透明底板凸显文字 -->
-                  <view class="book-overlay">
-                    <text class="ol-title">{{ item.node!.title }}</text>
-                    <text class="ol-sub">
-                      {{ authorOf(item.node!) || '未填写作者' }} · {{ noteCount(item.node!) }} 条感悟
-                    </text>
-                  </view>
-                </view>
-              </template>
-            </button>
+      <view v-if="category && !loading" class="shelf-row shelf-grid" :style="{ gridTemplateColumns: 'repeat(' + perRow + ', minmax(0, 1fr))' }">
+        <button
+          v-for="node in shelfCards"
+          :key="node.id"
+          class="book"
+          :aria-label="node.title + ' · ' + summaryOf(node)"
+          @click="openItem(node)"
+          @touchstart="press.onTouchStart($event, () => openMenu(node))"
+          @touchmove="press.onTouchMove"
+          @touchend="press.onTouchEnd"
+          @touchcancel="press.onTouchEnd"
+          @contextmenu.prevent="openMenu(node)"
+        >
+          <view class="cover-wrap">
+            <BookCover
+              :title="node.title"
+              :author="authorOf(node)"
+              :color="paletteOf(node).color"
+              :art="paletteOf(node).art"
+              :image="coverImage(node)"
+              :ribbon="node.nodeType === 'book' && inProgress(node)"
+            />
+            <view v-if="menuNode?.id === node.id && menuOpen" class="longpress-hint" />
+            <view class="book-overlay">
+              <text class="ol-title">{{ node.title }}</text>
+              <text class="ol-sub">{{ summaryOf(node) }}</text>
+            </view>
           </view>
-          <view class="shelf-plank" />
-        </template>
+        </button>
+        <button class="book" aria-label="添加书本或分类" @click="openCreate">
+          <view class="add-tile">
+            <AppIcon name="plus" :size="22" />
+            <text>添加</text>
+          </view>
+        </button>
       </view>
     </scroll-view>
 
     <template #footer><AppTabbar current="shelf" /></template>
 
-    <!-- 书本长按菜单 -->
-    <AppSheet v-model="menuOpen" :title="menuNode?.title || '书本'" :subtitle="menuSubtitle">
+    <AppSheet v-model="menuOpen" :title="menuNode?.title || '操作'" :subtitle="menuSubtitle">
       <view class="menu-head">
         <view class="menu-cover">
           <BookCover
@@ -97,28 +72,12 @@
           <text class="tiny">{{ menuSubtitle }}</text>
         </view>
       </view>
-      <button class="btn line sheet-btn" @click="editBook">
-        <AppIcon name="edit" :size="13" />编辑书本信息
+      <button class="btn line sheet-btn" @click="editItem">
+        <AppIcon name="edit" :size="13" />{{ menuIsCategory ? '编辑分类' : '编辑书本信息' }}
       </button>
-      <CategoryPicker label="移动书本到其他分类" @update:model-value="moveBook" />
-      <button class="btn line sheet-btn danger" @click="removeBook">
-        <AppIcon name="trash" :size="13" />删除书本
-      </button>
-    </AppSheet>
-
-    <!-- 分类更多菜单 -->
-    <AppSheet v-model="moreOpen" :title="category?.title || '分类'" subtitle="分类自身的操作">
-      <button class="btn line sheet-btn" @click="editCategory">
-        <AppIcon name="edit" :size="13" />编辑分类
-      </button>
-      <button class="btn line sheet-btn" @click="openSubcategoryForm">
-        <AppIcon name="layers" :size="13" />新建子分类
-      </button>
-      <button class="btn line sheet-btn" @click="moreToast('导出为 Markdown：整棵分类树按层级生成标题')">
-        <AppIcon name="upload" :size="13" />导出此分类
-      </button>
-      <button class="btn line sheet-btn danger" @click="removeCategory">
-        <AppIcon name="trash" :size="13" />删除分类
+      <CategoryPicker v-if="!menuIsCategory" label="移动书本到其他分类" @update:model-value="moveBook" />
+      <button class="btn line sheet-btn danger" @click="removeItem">
+        <AppIcon name="trash" :size="13" />{{ menuIsCategory ? '删除分类' : '删除书本' }}
       </button>
     </AppSheet>
     <AppToast />
@@ -137,13 +96,13 @@ import CategoryPicker from '../../components/CategoryPicker.vue'
 import BookCover from '../../components/BookCover.vue'
 import SortMenu from '../../components/SortMenu.vue'
 import { contentCover, coverImage } from '../../shared/covers'
-import { ROUTES, goHome, redirect } from '../../shared/navigation'
+import { ROUTES, goHome, redirect, routeForEdit, routeForNode } from '../../shared/navigation'
 import { breadcrumbOf, fetchNodePage, removeNode, useBookStore } from '../../shared/store'
 import type { BookNode } from '../../shared/types'
 import { parseContent } from '../../shared/types'
 import { pageOption, requireLogin, saveNode } from '../../shared/use-book'
 import { toast } from '../../shared/toast'
-import { chunk, usePerRow } from '../../shared/use-per-row'
+import { usePerRow } from '../../shared/use-per-row'
 import { useLongPress } from '../../shared/use-longpress'
 
 const store = useBookStore()
@@ -153,13 +112,13 @@ const loading = ref(true)
 const error = ref('')
 const menuOpen = ref(false)
 const menuNode = ref<BookNode>()
-const moreOpen = ref(false)
 const perRow = usePerRow()
 const press = useLongPress()
 
 const category = computed(() => tree.value.find(node => node.id === categoryId.value))
 const categoryPath = computed(() => breadcrumbOf(tree.value, categoryId.value))
-const subcategories = computed(() => tree.value.filter(node => node.parentId === categoryId.value && node.nodeType === 'category'))
+const children = computed(() => tree.value.filter(node => node.parentId === categoryId.value))
+const subcategories = computed(() => children.value.filter(node => node.nodeType === 'category'))
 const totals = computed(() => ({
   categories: subcategories.value.length,
   books: books.value.length,
@@ -172,8 +131,8 @@ const sortIndex = ref(0)
 function setSort(index: number) {
   sortIndex.value = index
 }
-const books = computed(() => tree.value
-  .filter(node => node.parentId === categoryId.value && node.nodeType === 'book')
+const books = computed(() => children.value
+  .filter(node => node.nodeType === 'book')
   .sort((a, b) => {
     const byTitle = a.title.localeCompare(b.title, 'zh')
     if (sortIndex.value === 2) return byTitle
@@ -191,21 +150,17 @@ const subtitle = computed(() => {
   return `${categories ? categories + ' 个子分类 · ' : ''}${books} 本 · ${notes} 条感悟`
 })
 
-/** 书架卡片：书本 + 末尾「添加书本」虚线卡。 */
-const shelfCards = computed(() => [
-  ...books.value.map(node => ({ key: node.id, node, add: false })),
-  { key: '__add', node: undefined, add: true }
-])
+/** 子分类排在书本前面，共用同一网格。 */
+const shelfCards = computed(() => [...subcategories.value, ...books.value])
+const menuIsCategory = computed(() => menuNode.value?.nodeType === 'category')
+const menuSubtitle = computed(() => menuNode.value ? summaryOf(menuNode.value) : '')
 
-/** 按每行 2/4 个分组，层板只托住这一行实际卡片。 */
-const shelfRows = computed(() => chunk(shelfCards.value, perRow.value))
-
-const menuSubtitle = computed(() => {
-  const node = menuNode.value
-  if (!node) return ''
-  const author = authorOf(node)
-  return `${author ? author + ' · ' : ''}${(node.childCount || 0)} 条感悟`
-})
+/** 通过副标题区分分类与书本。 */
+function summaryOf(node: BookNode) {
+  return node.nodeType === 'category'
+    ? `分类 · ${node.childCount || 0} 项`
+    : `${authorOf(node) || '未填写作者'} · ${noteCount(node)} 条感悟`
+}
 
 function authorOf(node: BookNode) {
   return parseContent(node).author || ''
@@ -225,10 +180,12 @@ function noteCount(node: BookNode) {
   return (node.childCount || 0)
 }
 
-function openBook(node: BookNode) {
+/** 打开网格中的书本或子分类。 */
+function openItem(node: BookNode) {
   // 刚触发过长按或菜单正开着时，这次点击不跳转
   if (press.consumeLongPress() || menuOpen.value) { menuOpen.value = false; return }
-  uni.navigateTo({ url: `${ROUTES.book}?id=${node.id}` })
+  if (node.nodeType === 'category') openCategory(node.id)
+  else uni.navigateTo({ url: routeForNode(node) })
 }
 
 function openMenu(node: BookNode) {
@@ -250,34 +207,18 @@ function backToParent() {
 
 onBackPress(event => event.from === 'backbutton' && !backToParent())
 
-function openSubcategoryForm() {
-  moreOpen.value = false
-  uni.navigateTo({ url: `${ROUTES.create}?kind=category&parentId=${categoryId.value}` })
-}
-
 function openCreate() {
   uni.navigateTo({ url: `${ROUTES.create}?kind=book&parentId=${categoryId.value}` })
 }
 
-function editBook() {
+/** 使用卡片类型打开已有的编辑页。 */
+function editItem() {
   const node = menuNode.value
   menuOpen.value = false
-  if (node) uni.navigateTo({ url: `${ROUTES.bookEdit}?id=${node.id}` })
+  if (node) uni.navigateTo({ url: routeForEdit(node) })
 }
 
-function editCategory() {
-  moreOpen.value = false
-  uni.navigateTo({ url: `${ROUTES.categoryEdit}?id=${categoryId.value}` })
-}
-
-function moreToast(message: string) {
-  moreOpen.value = false
-  toast(message)
-}
-
-
-
-/** 移动分类：选择另一个分类作为新父节点。 */
+/** 移动书本到所选分类。 */
 async function moveBook(parentId: string | null) {
   const node = menuNode.value
   if (!node || !parentId || parentId === node.parentId) return
@@ -290,18 +231,16 @@ async function moveBook(parentId: string | null) {
     toast(failure instanceof Error ? failure.message : '移动失败')
   }
 }
-
-
-
-async function removeBook() {
+/** 确认后删除选中的卡片及其下级内容。 */
+async function removeItem() {
   const node = menuNode.value
   menuOpen.value = false
   if (!node) return
-  const notes = noteCount(node)
+  const isCategory = node.nodeType === 'category'
   const confirmed = await new Promise<boolean>(resolve => {
     uni.showModal({
-      title: `删除《${node.title}》？`,
-      content: notes ? `${notes} 条感悟及其备注会一并删除` : '删除后无法恢复',
+      title: isCategory ? `删除「${node.title}」？` : `删除《${node.title}》？`,
+      content: noteCount(node) ? (isCategory ? '下级分类、书本及其内容会一并删除' : '感悟及其备注会一并删除') : '删除后无法恢复',
       confirmText: '确认删除',
       success: result => resolve(result.confirm),
       fail: () => resolve(false)
@@ -312,30 +251,6 @@ async function removeBook() {
     await removeNode(node.id)
     toast('已删除')
     await load()
-  } catch (failure) {
-    toast(failure instanceof Error ? failure.message : '删除失败')
-  }
-}
-
-async function removeCategory() {
-  moreOpen.value = false
-  if (!category.value) return
-  const confirmed = await new Promise<boolean>(resolve => {
-    uni.showModal({
-      title: `删除「${category.value?.title}」？`,
-      content: totals.value.categories || totals.value.books ? `${totals.value.categories} 个子分类及 ${totals.value.books} 本书会一并删除` : '删除后无法恢复',
-      confirmText: '确认删除',
-      success: result => resolve(result.confirm),
-      fail: () => resolve(false)
-    })
-  })
-  if (!confirmed) return
-  try {
-    const parent = category.value.parentId
-    await removeNode(categoryId.value)
-    toast('已删除')
-    if (parent) openCategory(parent)
-    else goHome()
   } catch (failure) {
     toast(failure instanceof Error ? failure.message : '删除失败')
   }
@@ -364,33 +279,8 @@ onShow(() => {
 </script>
 
 <style scoped>
-.category-actions { display: flex; align-items: center; gap: 4px; }
-.subcategories { margin: 0 5px 12px; }
-.subcategories-heading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  margin: 4px 0 7px;
-  color: var(--ink-700);
-  font-size: 13px;
-  font-weight: 600;
-}
-.subcategory {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  margin: 0 0 5px;
-  padding: 6px 10px;
-  text-align: left;
-  line-height: 1.6;
-  color: var(--ink-700);
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-}
-.subcategory-title { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.category-page :deep(.sk-plank) { display: none; }
+.category-page :deep(.sk-shelf-row) { margin-bottom: 18px; }
 .scroll {
   flex: 1;
   min-height: 0;
@@ -399,6 +289,7 @@ onShow(() => {
 }
 
 .book { display: block; width: 100%; padding: 0; border: 0; background: none; margin: 0; text-align: center; }
+.shelf-grid { padding-bottom: 12px; }
 .book-cover :deep(img) { width: 100%; height: 100%; object-fit: cover; }
 .cover-wrap { position: relative; }
 .longpress-hint { position: absolute; inset: 0; border-radius: 4px 7px 7px 4px; box-shadow: 0 0 0 2px var(--wood-500); pointer-events: none; }

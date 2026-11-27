@@ -21,6 +21,24 @@
         </view>
       </view>
 
+      <view v-if="weread" class="card">
+        <view class="between">
+          <text class="row-title">微信读书</text>
+          <button class="btn xs line" :disabled="startingWeRead || wereadTask?.state === 'running' || !weread.configured"
+            @click="syncWeRead">{{ startingWeRead || wereadTask?.state === 'running' ? '同步中…' : '同步微信读书' }}</button>
+        </view>
+        <text class="tiny weread-status" role="status">{{ wereadMessage }}</text>
+        <progress v-if="wereadTask?.state === 'running' && wereadTask.total"
+          :percent="percent(wereadTask.completed, wereadTask.total)" :stroke-width="4" />
+        <text v-if="wereadTask?.state === 'running' && wereadTask.total" class="tiny weread-status">
+          已处理 {{ wereadTask.completed }} / {{ wereadTask.total }} 本
+        </text>
+        <text v-else-if="wereadTask && wereadTask.state !== 'running'" class="tiny weread-status">
+          新增 {{ wereadTask.categories }} 个分类 · {{ wereadTask.books }} 本书 · {{ wereadTask.notes }} 条感悟
+          {{ wereadTask.failed ? ` · ${wereadTask.failed} 本失败` : '' }}
+        </text>
+      </view>
+
       <view class="card">
         <text class="row-title">外观</text>
         <view class="theme-row">
@@ -29,6 +47,7 @@
             :key="label"
             class="theme-chip"
             :class="{ on: theme.index === index }"
+            :aria-pressed="theme.index === index"
             @click="theme.set(index)"
           >
             {{ label }}
@@ -38,9 +57,14 @@
 
       <view class="card">
         <text class="row-title">离线数据</text>
-        <view class="data-row">
-          <text class="tiny">已缓存页面</text>
-          <text class="data-value">{{ cacheCount }} 个</text>
+        <view class="local-data">
+          <text class="tiny">本地数据数量</text>
+          <view class="local-counts">
+            <view v-for="(label, type) in TYPE_NAMES" :key="type" class="local-count">
+              <text class="local-value">{{ localCounts[type] }}</text>
+              <text class="tiny">{{ label }}</text>
+            </view>
+          </view>
         </view>
         <view class="data-row">
           <text class="tiny">上传进度</text>
@@ -48,7 +72,7 @@
         </view>
         <progress v-if="uploadProgress.total" :percent="uploadPercent" :stroke-width="4" />
         <view class="data-row">
-          <text class="tiny">更新进度</text>
+          <text class="tiny">下载进度</text>
           <text class="data-value">{{ downloadStatus }}</text>
         </view>
         <progress v-if="downloadProgress.total" :percent="downloadPercent" :stroke-width="4" />
@@ -64,7 +88,9 @@
           </view>
           <button v-if="entry.problemCode === 409" class="btn xs line" @click="resolveConflict(entry)">处理</button>
         </view>
-        <button class="btn line cache-btn"  :disabled="clearing" @click="clearCache">{{ clearing ? '正在清理…' : '清理本地缓存' }}</button>
+        <view class="cache-actions">
+          <button class="btn xs line" :disabled="clearing" @click="clearCache">{{ clearing ? '正在清理…' : '清理本地缓存' }}</button>
+        </view>
       </view>
 
       <view class="card">
@@ -81,20 +107,37 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
-import { onShow } from '@dcloudio/uni-app'
+import { computed, ref, shallowRef, watch } from 'vue'
+import { onHide, onShow, onUnload } from '@dcloudio/uni-app'
 import AppPage from '../../components/AppPage.vue'
 import AppToast from '../../components/AppToast.vue'
 import AppTabbar from '../../components/AppTabbar.vue'
 import AppIcon from '../../components/AppIcon.vue'
 import { baseApi } from '../../api-env'
 import { ROUTES, routeForNode } from '../../shared/navigation'
-import { cachedScopeCount, clearOfflineCache, clearSession, downloadProgress, fetchShelfStats, refreshAccountProfile, useBookStore, useTheme } from '../../shared/store'
+import { TYPE_NAMES, clearOfflineCache, clearSession, countOfflineNodes, downloadProgress, fetchShelfStats, readOfflineNodes, refreshAccountProfile, refreshActiveScope, request, useBookStore, useTheme, type OfflineNode } from '../../shared/store'
 import { requireLogin } from '../../shared/use-book'
 import { toast } from '../../shared/toast'
 import { pendingNotes, type PendingNote } from '../../shared/pending-notes'
 import { mediaProgress } from '../../shared/scope-media'
-import { noteSyncOffline, noteSyncRunning, retryPendingNote, uploadProgress } from '../../shared/note-sync'
+import { flushPendingUploads, noteSyncOffline, noteSyncRunning, retryPendingNote, uploadProgress } from '../../shared/note-sync'
+
+interface WeReadTask {
+  id: string
+  state: 'running' | 'succeeded' | 'partial' | 'failed'
+  total: number
+  completed: number
+  categories: number
+  books: number
+  notes: number
+  failed: number
+  message: string
+}
+
+interface WeReadStatus {
+  configured: boolean
+  task?: WeReadTask | null
+}
 
 const store = useBookStore()
 const profile = store.profile
@@ -112,8 +155,9 @@ watch(avatarSrc, () => { avatarFailed.value = false })
 const theme = useTheme()
 const stats = ref({ categories: 0, books: 0, notes: 0, weekNotes: 0 })
 const clearing = ref(false)
-const cacheCount = ref(0)
+const localNodes = shallowRef<OfflineNode[]>([])
 const pending = computed(() => pendingNotes(store.account.value))
+const localCounts = computed(() => countOfflineNodes(localNodes.value, pending.value))
 const problems = computed(() => pending.value.filter(entry => entry.problem))
 const syncStatus = computed(() => {
   if (noteSyncOffline.value) return `离线 · ${pending.value.length} 条待上传`
@@ -127,20 +171,99 @@ const uploadPercent = computed(() => percent(uploadProgress.value.completed, upl
 const downloadPercent = computed(() => percent(downloadProgress.completed, downloadProgress.total))
 const mediaPercent = computed(() => percent(mediaProgress.value.completed, mediaProgress.value.total))
 const downloadStatus = computed(() => {
-  if (downloadProgress.running) return `正在更新 · ${downloadProgress.completed} / ${downloadProgress.total} 层`
+  if (downloadProgress.running) return `正在下载 · ${downloadProgress.completed} / ${downloadProgress.total} 层`
   if (noteSyncOffline.value) return '离线'
   if (downloadProgress.problem) return downloadProgress.problem
   if (downloadProgress.updatedAt) return `已更新 · ${downloadProgress.changed} 条变化`
-  return '等待更新'
+  return '等待下载'
 })
 
-async function refreshStorage() {
-  const owner = store.account.value
-  const count = await cachedScopeCount(owner)
-  if (owner === store.account.value) cacheCount.value = count
+const weread = ref<WeReadStatus>()
+const wereadTask = computed(() => weread.value?.task)
+const startingWeRead = ref(false)
+const wereadError = ref('')
+const wereadMessage = computed(() => {
+  if (wereadError.value) return wereadError.value
+  if (!weread.value?.configured) return '请在管理端参数设置中配置微信读书 API Key'
+  if (startingWeRead.value) return '正在上传本地修改并提交同步任务…'
+  return wereadTask.value?.message || '每天 05:00 自动同步'
+})
+const wereadPath = '/book/weread/sync'
+let wereadTimer: ReturnType<typeof setTimeout> | undefined
+let wereadEpoch = 0
+
+function clearWeReadTimer() {
+  if (wereadTimer !== undefined) clearTimeout(wereadTimer)
+  wereadTimer = undefined
 }
 
-watch(() => downloadProgress.updatedAt, () => void refreshStorage())
+function applyWeReadStatus(value: WeReadStatus) {
+  const previous = wereadTask.value
+  const task = value.task
+  weread.value = value
+  wereadError.value = ''
+  clearWeReadTimer()
+  if (task?.state === 'running') {
+    wereadTimer = setTimeout(() => void readWeReadStatus(), 2000)
+  } else if (task && (previous?.id !== task.id || previous.state === 'running')
+    && (task.categories || task.books || task.notes)) {
+    refreshActiveScope()
+    void load()
+  }
+}
+
+async function readWeReadStatus() {
+  const epoch = wereadEpoch
+  try {
+    const value = await request<WeReadStatus>(wereadPath)
+    if (epoch === wereadEpoch && !startingWeRead.value) applyWeReadStatus(value)
+  } catch (failure) {
+    if (epoch === wereadEpoch && !startingWeRead.value && wereadTask.value?.state === 'running') {
+      wereadError.value = '暂时无法查看进度，正在重试…'
+      wereadTimer = setTimeout(() => void readWeReadStatus(), 5000)
+    }
+  }
+}
+
+async function syncWeRead() {
+  if (startingWeRead.value || wereadTask.value?.state === 'running') return
+  const epoch = ++wereadEpoch
+  const owner = store.account.value
+  const token = store.token.value
+  startingWeRead.value = true
+  wereadError.value = ''
+  clearWeReadTimer()
+  try {
+    await flushPendingUploads()
+    if (epoch !== wereadEpoch || owner !== store.account.value || token !== store.token.value) return
+    const value = await request<WeReadStatus>(wereadPath, 'POST')
+    if (epoch === wereadEpoch) applyWeReadStatus(value)
+  } catch (failure) {
+    if (epoch === wereadEpoch) wereadError.value = failure instanceof Error ? failure.message : '提交同步失败'
+  } finally {
+    if (epoch === wereadEpoch) startingWeRead.value = false
+  }
+}
+
+function stopWeReadPolling() {
+  wereadEpoch++
+  startingWeRead.value = false
+  clearWeReadTimer()
+}
+
+let storageRead = 0
+
+/** 从本机重新读取各类节点，忽略晚到的旧读取结果。 */
+async function refreshStorage() {
+  const owner = store.account.value
+  const read = ++storageRead
+  const rows = await readOfflineNodes(owner)
+  if (read === storageRead && owner === store.account.value) localNodes.value = rows
+}
+
+watch([() => downloadProgress.updatedAt, noteSyncRunning], () => {
+  if (!clearing.value && !noteSyncRunning.value) void refreshStorage()
+})
 
 function openPending(entry: PendingNote) {
   if (entry.operation === 'delete') return
@@ -178,7 +301,6 @@ async function load() {
   } finally {
     loading.value = false
   }
-  refreshStorage()
 }
 
 function clearCache() {
@@ -218,9 +340,13 @@ function logout() {
 onShow(() => {
   if (!requireLogin()) return
   avatarFailed.value = false
+  void refreshStorage()
   void refreshAccountProfile().catch(() => { if (!store.token.value) requireLogin() })
   void load()
+  void readWeReadStatus()
 })
+onHide(stopWeReadPolling)
+onUnload(stopWeReadPolling)
 </script>
 
 <style scoped>
@@ -254,6 +380,7 @@ onShow(() => {
 .profile-account { margin-top: 3px; font-size: 12px; color: var(--ink-500); }
 .profile .btn { flex-shrink: 0; }
 .row-title { font-size: 13px; font-weight: 650; }
+.weread-status { display: block; margin-top: 8px; }
 
 .theme-row { display: flex; gap: 7px; margin-top: 10px; }
 .theme-chip {
@@ -271,7 +398,12 @@ onShow(() => {
 
 .data-row { display: flex; align-items: center; justify-content: space-between; margin-top: 8px; }
 .data-value { font-size: 12.5px; color: var(--ink-700); font-weight: 600; }
-.cache-btn { margin-top: 12px; }
+.local-data { margin: 9px 0 12px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+.local-counts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 6px; }
+.local-count { display: flex; flex-direction: column; align-items: center; }
+.local-value { color: var(--ink-800); font-size: 17px; line-height: 1.4; font-weight: 650; font-variant-numeric: tabular-nums; }
+.cache-actions { display: flex; justify-content: flex-end; margin-top: 12px; }
+.cache-actions .btn { margin: 0; }
 
 .sync-row { display: flex; align-items: center; gap: 8px; padding-top: 10px; }
 .sync-title { display: block; font-size: 13px; color: var(--ink-800); }
