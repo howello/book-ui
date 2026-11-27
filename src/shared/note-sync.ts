@@ -1,14 +1,16 @@
 import { ref, watch } from 'vue'
 import { baseApi } from '../api-env'
 import { localMediaPath, readLocalBlob } from './media'
-import { pendingNote, pendingNotes, writePendingNote, type PendingNote } from './pending-notes'
-import { ApiError, cacheSyncedNote, clearSession, request, useBookStore } from './store'
+import { pendingNote, pendingNotes, restorePendingNotes, writePendingNote, type PendingNote } from './pending-notes'
+import { ApiError, cacheSyncedDeletion, cacheSyncedNote, clearSession, refreshActiveScope, registerBeforePull, request, useBookStore } from './store'
 import { parseContent, stringifyContent, type BookNode, type NodeContent, type NoteBlock } from './types'
-import { newId, saveNode } from './use-book'
+import { importCover, newId, submitNode } from './use-book'
 
 const store = useBookStore()
 export const noteSyncRunning = ref(false)
 export const noteSyncOffline = ref(false)
+export const uploadProgress = ref({ total: 0, completed: 0, failed: 0 })
+let activeUpload: Promise<void> | undefined
 const acknowledged = new Map<string, { revision: string; version?: number }>()
 let started = false
 let timer: ReturnType<typeof setTimeout> | undefined
@@ -35,10 +37,12 @@ export function queueNote(owner: string, node: BookNode, lastRevision?: string) 
 export function startNoteSync() {
   if (!started) {
     started = true
+    registerBeforePull(flushPendingUploads, () => scheduleNoteSync())
+    watch(store.account, () => scheduleNoteSync())
     watch(store.token, () => scheduleNoteSync())
     uni.onNetworkStatusChange(event => {
       noteSyncOffline.value = !event.isConnected
-      if (event.isConnected) scheduleNoteSync()
+      if (event.isConnected) { scheduleNoteSync(); refreshActiveScope() }
     })
     uni.getNetworkType({
       success: result => {
@@ -54,7 +58,7 @@ export function scheduleNoteSync(delay = 0) {
   if (timer !== undefined) clearTimeout(timer)
   timer = setTimeout(() => {
     timer = undefined
-    void syncNotes()
+    void flushPendingUploads()
   }, delay)
 }
 
@@ -149,6 +153,28 @@ function serverContent(content: NodeContent) {
 async function sendNote(owner: string, token: string, entry: PendingNote) {
   const { id } = entry.node
   const active = () => sameSession(owner, token) && pendingNote(owner, id)?.revision === entry.revision
+  if (entry.operation === 'delete') {
+    let removed: string[]
+    try {
+      removed = await request<string[]>('/book/nodes/' + id, 'DELETE')
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.status !== 404) throw error
+      removed = [id]
+    }
+    if (!active()) return
+    await cacheSyncedDeletion(owner, removed)
+    if (active()) writePendingNote(owner, id)
+    return
+  }
+  const cover = entry.node.pendingCover
+  if (cover) {
+    const url = cover.localKey
+      ? await upload({ id: 'cover', type: 'image', localKey: cover.localKey }, owner, token)
+      : await importCover(cover.remoteUrl || '')
+    if (!active()) return
+    entry.node = { ...entry.node, coverKind: 'public', coverRef: url, pendingCover: undefined }
+    writePendingNote(owner, id, entry)
+  }
   const content = parseContent(entry.node)
   for (const block of content.blocks || []) {
     if (!block.url && block.localKey) {
@@ -160,16 +186,16 @@ async function sendNote(owner: string, token: string, entry: PendingNote) {
     }
   }
   if (!active()) return
-  const payload = serverContent(content)
+  const payload = entry.node.nodeType === 'note' ? serverContent(content) : entry.node.contentJson ?? null
   entry.attempted = true
   writePendingNote(owner, id, entry)
   let saved: BookNode
   try {
-    saved = await saveNode(entry.node, payload)
+    saved = await submitNode(entry.node, payload)
   } catch (failure) {
     if (!(failure instanceof ApiError) || failure.status !== 409 || !active()) throw failure
     const remote = await request<BookNode>('/book/nodes/' + id)
-    if (remote.title !== entry.node.title || remote.parentId !== entry.node.parentId
+    if (remote.title !== entry.node.title || (remote.parentId || null) !== (entry.node.parentId || null)
         || !sameJson(parseContent(remote), JSON.parse(payload || '{}'))) throw failure
     saved = remote
   }
@@ -182,25 +208,44 @@ async function sendNote(owner: string, token: string, entry: PendingNote) {
   acknowledged.set(owner + ':' + id, { revision: entry.revision, version: saved.version })
   const latest = pendingNote(owner, id)
   if (!latest) return
-  try { cacheSyncedNote(owner, saved) } catch { /* 同步已成功，缓存空间不足留待下次在线刷新。 */ }
-  if (latest.revision === entry.revision) writePendingNote(owner, id)
-  else writePendingNote(owner, id, { ...latest, node: { ...latest.node, version: saved.version } })
+  try { await cacheSyncedNote(owner, saved) } catch { /* 同步已成功，缓存空间不足留待下次在线刷新。 */ }
+  const current = pendingNote(owner, id)
+  if (!current || !sameSession(owner, token)) return
+  if (current.revision === entry.revision) writePendingNote(owner, id)
+  else writePendingNote(owner, id, { ...current, node: { ...current.node, version: saved.version } })
 }
 
-async function syncNotes() {
-  if (noteSyncRunning.value || noteSyncOffline.value) return
+export function flushPendingUploads() {
+  if (activeUpload) return activeUpload
+  activeUpload = syncNodes().finally(() => { activeUpload = undefined })
+  return activeUpload
+}
+
+async function syncNodes() {
+  if (noteSyncOffline.value) return
   const owner = store.account.value
   const token = store.token.value
   if (!owner || !token || !baseApi()) return
+  await restorePendingNotes(owner)
+  if (!sameSession(owner, token)) return
+  const queued = pendingNotes(owner).filter(item => !item.problem)
+  if (!queued.length) return
+  uploadProgress.value = { total: queued.length, completed: 0, failed: 0 }
   noteSyncRunning.value = true
   let retry = false
   const postponed = new Set<string>()
   try {
     while (sameSession(owner, token) && !noteSyncOffline.value) {
-      const entry = pendingNotes(owner).find(item => !item.problem && !postponed.has(item.node.id))
+      const queue = pendingNotes(owner)
+      const entry = queue.find(item => !item.problem && !postponed.has(item.node.id)
+        && (item.operation === 'delete' || !queue.some(parent => parent.node.id === item.node.parentId && !parent.node.version)))
       if (!entry) break
       try {
         await sendNote(owner, token, entry)
+        if (pendingNote(owner, entry.node.id)?.revision !== entry.revision) {
+          uploadProgress.value.completed++
+          uploadProgress.value.total = Math.max(uploadProgress.value.total, uploadProgress.value.completed + uploadProgress.value.failed)
+        }
       } catch (failure) {
         if (!sameSession(owner, token)) break
         const latest = pendingNote(owner, entry.node.id)
@@ -214,6 +259,7 @@ async function syncNotes() {
           retry = true
           continue
         }
+        uploadProgress.value.failed++
         writePendingNote(owner, entry.node.id, { ...latest, problem: failure.message, problemCode: failure.status })
       }
     }

@@ -104,8 +104,8 @@
         <button class="canvas-tool" aria-label="放大" @click="zoomBy(1.22)"><AppIcon name="zoom-in" :size="15" /></button>
         <button class="canvas-tool" aria-label="缩小" @click="zoomBy(1 / 1.22)"><AppIcon name="zoom-out" :size="15" /></button>
         <button class="canvas-tool" aria-label="适应屏幕" @click="fit"><AppIcon name="fit" :size="15" /></button>
-        <button class="canvas-tool" aria-label="全部展开" @click="expandAll"><AppIcon name="expand" :size="15" /></button>
-        <button class="canvas-tool" aria-label="只看两层" @click="collapseAll"><AppIcon name="collapse" :size="15" /></button>
+        <button class="canvas-tool" aria-label="展开已加载节点" @click="expandAll"><AppIcon name="expand" :size="15" /></button>
+        <button class="canvas-tool" aria-label="折叠到分类" @click="collapseAll"><AppIcon name="collapse" :size="15" /></button>
       </view>
 
       <view
@@ -145,6 +145,7 @@ import {
   ROOT_ID,
   TYPE_NAMES,
   fetchNodes,
+  groupByParent,
   iconOfType,
   mindLayout,
   outlineRows,
@@ -162,7 +163,8 @@ const store = useBookStore()
 const tree = ref<BookNode[]>([])
 const error = ref('')
 const view = ref<'outline' | 'canvas'>('outline')
-let initialized = false
+const loadedScopes = new Set<string>()
+const loadingScopes = new Set<string>()
 const collapsed = reactive(new Set<string>())
 const focus = ref('')
 
@@ -232,14 +234,59 @@ function metaOf(node: BookNode, children: number) {
 
 /** 点条目：只折叠 / 展开，不跳转；跳转只走右侧箭头。 */
 function toggleRow(node: BookNode) {
-  if (!tree.value.some(child => child.parentId === node.id)) return
+  if (!node.childCount && !tree.value.some(child => child.parentId === node.id)) return
   focus.value = node.id
   toggle(node.id)
 }
 
 function toggle(id: string) {
-  if (collapsed.has(id)) collapsed.delete(id)
-  else collapsed.add(id)
+  if (id === ROOT_ID) {
+    if (collapsed.has(id)) collapsed.delete(id)
+    else collapsed.add(id)
+    return
+  }
+  if (!collapsed.has(id)) {
+    collapsed.add(id)
+    return
+  }
+  collapsed.delete(id)
+  void loadLevel(id)
+}
+
+function applyLevel(parent: string | null, children: BookNode[]) {
+  const current = new Set(children.map(node => node.id))
+  const orphaned = new Set(tree.value.filter(node => (node.parentId || null) === parent && !current.has(node.id)).map(node => node.id))
+  const byParent = groupByParent(tree.value)
+  for (const id of orphaned) for (const child of byParent.get(id) || []) orphaned.add(child.id)
+  const known = new Set(tree.value.map(node => node.id))
+  tree.value = [...tree.value.filter(node => (node.parentId || null) !== parent && !orphaned.has(node.id)), ...children]
+  for (const child of children) if (!known.has(child.id)) collapsed.add(child.id)
+  for (const id of orphaned) {
+    loadedScopes.delete(id)
+    collapsed.delete(id)
+  }
+}
+
+async function loadLevel(id: string) {
+  if (loadingScopes.has(id)) return
+  loadingScopes.add(id)
+  const owner = store.account.value
+  const apply = (children: BookNode[]) => {
+    if (owner === store.account.value) {
+      applyLevel(id, children)
+      loadedScopes.add(id)
+    }
+  }
+  try {
+    apply(await fetchNodes({ parentId: id }, apply))
+  } catch (failure) {
+    if (owner === store.account.value) {
+      collapsed.add(id)
+      toast(failure instanceof Error ? failure.message : '加载失败')
+    }
+  } finally {
+    loadingScopes.delete(id)
+  }
 }
 
 /** 画布上的节点颜色：按类型分层，选中与路径高亮用 CSS class 表达。 */
@@ -405,17 +452,15 @@ function fit() {
 }
 
 function expandAll() {
-  collapsed.clear()
-  toast('全部展开 · ' + count.value + ' 个节点')
+  collapsed.delete(ROOT_ID)
+  for (const id of loadedScopes) collapsed.delete(id)
+  toast('已展开已加载的节点')
 }
 
-/** 收起到「分类 → 书」两层：书本以下全部折叠。 */
 function collapseAll() {
   collapsed.clear()
-  for (const node of tree.value) {
-    if (node.nodeType === 'book' && tree.value.some(item => item.parentId === node.id)) collapsed.add(node.id)
-  }
-  toast('已收起到书本层')
+  for (const node of tree.value) collapsed.add(node.id)
+  toast('已折叠到分类')
 }
 
 /* ---------- 手势：单指平移、双指缩放 ---------- */
@@ -527,14 +572,11 @@ async function load() {
   loading.value = true
   hasLoaded = true
   try {
-    tree.value = await fetchNodes({ tree: true })
-    if (!initialized) {
-      initialized = true
-      // 目录大纲默认折叠：根展开露出分类，分类及以下折叠
-      for (const node of tree.value) {
-        if (tree.value.some(item => item.parentId === node.id)) collapsed.add(node.id)
-      }
+    const apply = (rows: BookNode[]) => {
+      applyLevel(null, rows)
+      loading.value = false
     }
+    apply(await fetchNodes({}, apply))
   } catch (failure) {
     error.value = failure instanceof Error ? failure.message : '加载失败'
   } finally {

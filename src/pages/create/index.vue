@@ -40,7 +40,7 @@
 
         <view class="field">
           <text class="label">父分类</text>
-          <view class="input picker">书架根目录</view>
+          <CategoryPicker v-model="folderParentId" allow-root label="父分类" />
           <text class="hint">分类可以嵌套：例如「技术 / 系统设计」</text>
         </view>
       </view>
@@ -118,9 +118,7 @@
 
         <view class="field">
           <text class="label">归入分类</text>
-          <picker :range="parentLabels" :value="parentIndex" @change="onParentChange">
-            <view class="input picker">{{ parentLabels[parentIndex] }}</view>
-          </picker>
+          <CategoryPicker v-model="parentId" label="归入分类" />
         </view>
 
         <view class="field">
@@ -169,15 +167,16 @@ import { onLoad } from '@dcloudio/uni-app'
 import AppPage from '../../components/AppPage.vue'
 import AppToast from '../../components/AppToast.vue'
 import AppIcon from '../../components/AppIcon.vue'
+import CategoryPicker from '../../components/CategoryPicker.vue'
 import AppImage from '../../components/AppImage.vue'
 import CoverFace from '../../components/CoverFace.vue'
 import CoverFinder from '../../components/CoverFinder.vue'
 import { joinCoverRef, libraryCoverUrl, randomLibraryCover } from '../../shared/covers'
 import { ROUTES, goBack, goHome } from '../../shared/navigation'
-import { fetchNodes, useBookStore } from '../../shared/store'
+import { fetchNodes, readCachedNodes, useBookStore } from '../../shared/store'
 import type { BookNode } from '../../shared/types'
 import { stringifyContent } from '../../shared/types'
-import { importCover, pageOption, requireLogin, saveNode } from '../../shared/use-book'
+import { pageOption, requireLogin, saveNode } from '../../shared/use-book'
 import { toast } from '../../shared/toast'
 
 const store = useBookStore()
@@ -229,16 +228,8 @@ function shuffleBookCover() {
   bookCover.value = ''
 }
 
-/** 分类候选：根目录 + 所有分类（书本只能挂在分类下）。 */
-const categories = computed(() => tree.value.filter(node => node.nodeType === 'category'))
-const parentLabels = computed(() => categories.value.map(node => node.title))
-const parentIndex = ref(0)
+const folderParentId = ref<string | null>(null)
 const parentId = ref<string | null>(null)
-
-function onParentChange(event: { detail: { value: string | number } }) {
-  parentIndex.value = Number(event.detail.value)
-  parentId.value = categories.value[parentIndex.value]?.id || null
-}
 
 function openFinder(mode: 'books' | 'themes') {
   finderMode.value = mode
@@ -288,29 +279,31 @@ function applyPick(pick: {
   }
 }
 
-/** 分类表单：分类建在书架根目录。 */
+/** 分类表单：保存所选父分类，根目录没有父节点。 */
 async function submitCategory() {
   const title = folderTitle.value.trim()
   if (!title) { toast('请填写分类名称'); return }
   // 图库图随包发布，直接存相对路径；在线图先转存到 R2
-  const onlineCover = folderCover.value ? await importCover(folderCover.value) : ''
-  const kind = onlineCover ? 'public' : folderLibrary.value ? 'local' : 'theme'
-  const ref = onlineCover || folderLibrary.value || joinCoverRef(folderColor.value, folderArt.value)
+  const kind = folderLibrary.value ? 'local' : 'theme'
+  const ref = folderLibrary.value || joinCoverRef(folderColor.value, folderArt.value)
   const created = await saveNode({
     id: newId(),
-    parentId: null,
+    parentId: folderParentId.value,
     nodeType: 'category',
     title,
-    sortOrder: categories.value.length + 1,
+    sortOrder: Math.max(0, ...(await readCachedNodes({ parentId: folderParentId.value }) || []).map(node => node.sortOrder ?? 0)) + 1,
     coverKind: kind,
-    coverRef: ref
+    coverRef: ref,
+    pendingCover: folderCover.value ? { remoteUrl: folderCover.value } : undefined
   } as BookNode, stringifyContent({
     desc: folderDesc.value.trim(),
     color: folderColor.value,
     art: folderArt.value
   }))
   toast(`已新建分类「${title}」`)
-  uni.redirectTo({ url: `${ROUTES.category}?id=${created.id}` })
+  const pages = getCurrentPages()
+  if (pages[pages.length - 2]?.route === ROUTES.category.slice(1)) uni.navigateBack()
+  else uni.redirectTo({ url: `${ROUTES.category}?id=${created.id}` })
 }
 
 /** 书本表单：必须落在某个分类下。 */
@@ -318,17 +311,17 @@ async function submitBook() {
   const title = bookTitle.value.trim()
   if (!title) { toast('请填写书名'); return }
   if (!parentId.value) { toast('请先选择一个分类'); return }
-  const onlineCover = bookCover.value ? await importCover(bookCover.value) : ''
-  const kind = onlineCover ? 'public' : bookLibrary.value ? 'local' : 'theme'
-  const ref = onlineCover || bookLibrary.value || joinCoverRef(bookColor.value, bookArt.value)
+  const kind = bookLibrary.value ? 'local' : 'theme'
+  const ref = bookLibrary.value || joinCoverRef(bookColor.value, bookArt.value)
   const created = await saveNode({
     id: newId(),
     parentId: parentId.value,
     nodeType: 'book',
     title,
-    sortOrder: tree.value.filter(node => node.parentId === parentId.value).length + 1,
+    sortOrder: Math.max(0, ...(await readCachedNodes({ parentId: parentId.value }) || []).map(node => node.sortOrder ?? 0)) + 1,
     coverKind: kind,
-    coverRef: ref
+    coverRef: ref,
+    pendingCover: bookCover.value ? { remoteUrl: bookCover.value } : undefined
   } as BookNode, stringifyContent({
     author: bookAuthor.value.trim(),
     publisher: bookPublisher.value.trim(),
@@ -383,14 +376,10 @@ onLoad(async options => {
   folderLibrary.value = randomLibraryCover()
   bookLibrary.value = randomLibraryCover(folderLibrary.value)
   try {
-    tree.value = await fetchNodes({ tree: true })
-    if (parent) {
-      parentIndex.value = Math.max(0, categories.value.findIndex(node => node.id === parent))
-      parentId.value = parent
-    } else if (categories.value[0]) {
-      parentId.value = categories.value[0].id
-      parentIndex.value = 0
-    }
+    folderParentId.value = parent || null
+    parentId.value = parent || null
+    tree.value = await fetchNodes({ parentId: parent || null }, rows => { tree.value = rows; loading.value = false }).catch(() => [])
+    if (!parent) parentId.value = tree.value.find(node => node.nodeType === 'category')?.id || null
   } catch (failure) {
     toast(failure instanceof Error ? failure.message : '加载失败')
   } finally {

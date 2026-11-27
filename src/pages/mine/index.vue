@@ -43,9 +43,20 @@
           <text class="data-value">{{ cacheCount }} 个</text>
         </view>
         <view class="data-row">
-          <text class="tiny">感悟同步</text>
+          <text class="tiny">上传进度</text>
           <text class="data-value">{{ syncStatus }}</text>
         </view>
+        <progress v-if="uploadProgress.total" :percent="uploadPercent" :stroke-width="4" />
+        <view class="data-row">
+          <text class="tiny">更新进度</text>
+          <text class="data-value">{{ downloadStatus }}</text>
+        </view>
+        <progress v-if="downloadProgress.total" :percent="downloadPercent" :stroke-width="4" />
+        <view v-if="mediaProgress.total" class="data-row">
+          <text class="tiny">图片与录音</text>
+          <text class="data-value">{{ mediaProgress.completed }} / {{ mediaProgress.total }}{{ mediaProgress.failed ? ` · ${mediaProgress.failed} 项失败` : '' }}</text>
+        </view>
+        <progress v-if="mediaProgress.total" :percent="mediaPercent" :stroke-width="4" />
         <view v-for="entry in problems" :key="entry.node.id" class="sync-row">
           <view class="grow" @click="openPending(entry)">
             <text class="sync-title">{{ entry.node.title }}</text>
@@ -53,7 +64,7 @@
           </view>
           <button v-if="entry.problemCode === 409" class="btn xs line" @click="resolveConflict(entry)">处理</button>
         </view>
-        <button class="btn line cache-btn" @click="clearCache">清理本机缓存</button>
+        <button class="btn line cache-btn"  :disabled="clearing" @click="clearCache">{{ clearing ? '正在清理…' : '清理本地缓存' }}</button>
       </view>
 
       <view class="card">
@@ -76,14 +87,14 @@ import AppPage from '../../components/AppPage.vue'
 import AppToast from '../../components/AppToast.vue'
 import AppTabbar from '../../components/AppTabbar.vue'
 import AppIcon from '../../components/AppIcon.vue'
-import { baseApi, bookStoragePrefix } from '../../api-env'
-import { ROUTES } from '../../shared/navigation'
-import { clearSession, fetchNodes, refreshAccountProfile, shelfStats, useBookStore, useTheme } from '../../shared/store'
-import type { BookNode } from '../../shared/types'
+import { baseApi } from '../../api-env'
+import { ROUTES, routeForNode } from '../../shared/navigation'
+import { cachedScopeCount, clearOfflineCache, clearSession, downloadProgress, fetchShelfStats, refreshAccountProfile, useBookStore, useTheme } from '../../shared/store'
 import { requireLogin } from '../../shared/use-book'
 import { toast } from '../../shared/toast'
 import { pendingNotes, type PendingNote } from '../../shared/pending-notes'
-import { noteSyncOffline, noteSyncRunning, retryPendingNote } from '../../shared/note-sync'
+import { mediaProgress } from '../../shared/scope-media'
+import { noteSyncOffline, noteSyncRunning, retryPendingNote, uploadProgress } from '../../shared/note-sync'
 
 const store = useBookStore()
 const profile = store.profile
@@ -99,28 +110,42 @@ const avatarFailed = ref(false)
 watch(avatarSrc, () => { avatarFailed.value = false })
 
 const theme = useTheme()
-const tree = ref<BookNode[]>([])
+const stats = ref({ categories: 0, books: 0, notes: 0, weekNotes: 0 })
+const clearing = ref(false)
 const cacheCount = ref(0)
 const pending = computed(() => pendingNotes(store.account.value))
 const problems = computed(() => pending.value.filter(entry => entry.problem))
 const syncStatus = computed(() => {
   if (noteSyncOffline.value) return `离线 · ${pending.value.length} 条待上传`
-  if (noteSyncRunning.value) return `正在同步 · ${pending.value.length} 条`
+  if (noteSyncRunning.value) return `正在上传 · ${uploadProgress.value.completed} / ${uploadProgress.value.total}`
   if (pending.value.length) return `${pending.value.length} 条待上传`
   return '已同步'
 })
 
-const stats = computed(() => shelfStats(tree.value))
+const percent = (done: number, total: number) => total ? Math.min(100, Math.round(done * 100 / total)) : 0
+const uploadPercent = computed(() => percent(uploadProgress.value.completed, uploadProgress.value.total))
+const downloadPercent = computed(() => percent(downloadProgress.completed, downloadProgress.total))
+const mediaPercent = computed(() => percent(mediaProgress.value.completed, mediaProgress.value.total))
+const downloadStatus = computed(() => {
+  if (downloadProgress.running) return `正在更新 · ${downloadProgress.completed} / ${downloadProgress.total} 层`
+  if (noteSyncOffline.value) return '离线'
+  if (downloadProgress.problem) return downloadProgress.problem
+  if (downloadProgress.updatedAt) return `已更新 · ${downloadProgress.changed} 条变化`
+  return '等待更新'
+})
 
-/** 缓存按当前账号统计。 */
-function refreshStorage() {
+async function refreshStorage() {
   const owner = store.account.value
-  const keys = uni.getStorageInfoSync().keys
-  cacheCount.value = keys.filter(key => key.startsWith(`${bookStoragePrefix}-cache:${owner}:`)).length
+  const count = await cachedScopeCount(owner)
+  if (owner === store.account.value) cacheCount.value = count
 }
 
+watch(() => downloadProgress.updatedAt, () => void refreshStorage())
+
 function openPending(entry: PendingNote) {
-  uni.navigateTo({ url: `${ROUTES.noteEdit}?id=${entry.node.id}` })
+  if (entry.operation === 'delete') return
+  const url = entry.node.nodeType === 'note' ? `${ROUTES.noteEdit}?id=${entry.node.id}` : routeForNode(entry.node)
+  uni.navigateTo({ url })
 }
 
 function resolveConflict(entry: PendingNote) {
@@ -147,9 +172,9 @@ async function load() {
   loading.value = true
   hasLoaded = true
   try {
-    tree.value = await fetchNodes({ tree: true })
+    stats.value = await fetchShelfStats(value => { stats.value = value; loading.value = false })
   } catch {
-    tree.value = []
+    // 离线时保留上次的书架概况。
   } finally {
     loading.value = false
   }
@@ -157,17 +182,25 @@ async function load() {
 }
 
 function clearCache() {
-  const owner = store.account.value
-  const keys = uni.getStorageInfoSync().keys
-  let removed = 0
-  for (const key of keys) {
-    if (key.startsWith(`${bookStoragePrefix}-cache:${owner}:`)) {
-      uni.removeStorageSync(key)
-      removed += 1
+  if (clearing.value) return
+  uni.showModal({
+    title: '清理本地缓存？',
+    content: '会清除已下载的节点、封面和录音。待上传的修改、附件和草稿会保留。',
+    confirmText: '清理',
+    async success(result) {
+      if (!result.confirm || clearing.value) return
+      clearing.value = true
+      try {
+        await clearOfflineCache(store.account.value)
+        await refreshStorage()
+        toast('已清理本地缓存')
+      } catch {
+        toast('清理未完成，请重试')
+      } finally {
+        clearing.value = false
+      }
     }
-  }
-  refreshStorage()
-  toast(removed ? `已清理 ${removed} 个缓存页面` : '没有可清理的缓存')
+  })
 }
 
 function logout() {

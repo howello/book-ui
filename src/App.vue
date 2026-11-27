@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onLaunch, onShow } from '@dcloudio/uni-app'
 import { checkAndUpdateApp } from './app-update'
-import { useTheme } from './shared/store'
+import { refreshActiveScope, useTheme } from './shared/store'
 import { scheduleNoteSync, startNoteSync } from './shared/note-sync'
 
 onLaunch(() => {
@@ -10,7 +10,7 @@ onLaunch(() => {
   void checkAndUpdateApp()
 })
 
-onShow(() => scheduleNoteSync())
+onShow(() => { scheduleNoteSync(); refreshActiveScope() })
 </script>
 
 <style lang="scss">

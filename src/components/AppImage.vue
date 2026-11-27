@@ -2,10 +2,10 @@
   <view class="app-image" :class="{ fill, loading: !loaded && !failed }" :style="[wrapStyle, placeholderStyle]">
     <view v-if="!loaded && !failed" class="img-skeleton" :class="rounded ? 'rounded' : ''" />
     <image
-      v-if="src && !failed"
+      v-if="displaySrc && !failed"
       class="app-image-inner"
       :class="{ 'is-loaded': loaded, rounded }"
-      :src="src"
+      :src="displaySrc"
       :mode="mode"
       :style="innerStyle"
       @load="onLoad"
@@ -17,6 +17,8 @@
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import { useOfflineMedia } from '../shared/media'
+import { useBookStore } from '../shared/store'
 
 /**
  * 带骨架的图片。
@@ -40,6 +42,9 @@ const props = withDefaults(defineProps<{
   innerStyle?: string | Record<string, string>
 }>(), { src: '', mode: 'aspectFill', rounded: false, fill: false, ratio: '', wrapStyle: '', innerStyle: '' })
 
+const store = useBookStore()
+const localMedia = useOfflineMedia(() => store.account.value, () => [props.src])
+const displaySrc = computed(() => localMedia(props.src))
 const loaded = ref(false)
 const failed = ref(false)
 
@@ -50,7 +55,7 @@ const placeholderStyle = computed(() => {
 })
 
 // 换图时重置状态，重新走一遍骨架
-watch(() => props.src, () => {
+watch(displaySrc, () => {
   loaded.value = false
   failed.value = false
 })

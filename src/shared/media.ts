@@ -1,5 +1,6 @@
 import { bookStoragePrefix } from '../api-env'
 import { mediaBlob } from '../media-cache'
+import { cacheRemoteMedia } from './scope-media'
 import { onUnmounted, reactive, watch } from 'vue'
 import type { NoteBlock } from './types'
 
@@ -69,9 +70,55 @@ export function useNoteMedia(owner: () => string, blocks: () => NoteBlock[]) {
     }, { immediate: true })
   onUnmounted(() => previews.forEach(url => URL.revokeObjectURL(url)))
   // #endif
+  const remote = useOfflineMedia(owner, () => blocks().map(block => block.url || ''))
   return (block: NoteBlock) => (block.localKey &&
-    (previews.get(block.localKey) || localMediaPath(owner(), block.localKey))) || block.url || ''
+    (previews.get(block.localKey) || localMediaPath(owner(), block.localKey))) || remote(block.url || '')
 }
+async function savedCoverMedia(owner: string, key: string): Promise<Blob | string | undefined> {
+  if (!owner || !key.startsWith(owner + ':')) return
+  // #ifdef APP-PLUS
+  return localMediaPath(owner, key)
+  // #endif
+  // #ifdef H5
+  return readLocalBlob(key)
+  // #endif
+}
+
+/** 将已缓存的远端文件还原为可显示或播放的本机地址。 */
+export function useOfflineMedia(owner: () => string, sources: () => string[]) {
+  const local = reactive(new Map<string, string>())
+  const revoke = (url: string) => {
+    // #ifdef H5
+    if (url.startsWith('blob:')) URL.revokeObjectURL(url)
+    // #endif
+  }
+  watch(() => ({ owner: owner(), urls: [...new Set(sources())] }), (next, previous, cleanup) => {
+    let active = true
+    cleanup(() => { active = false })
+    for (const [url, address] of local) {
+      if (next.owner !== previous?.owner || !next.urls.includes(url)) {
+        revoke(address)
+        local.delete(url)
+      }
+    }
+    for (const url of next.urls) {
+      if (!url || local.has(url)) continue
+      const prefix = 'book-local-media:'
+      const key = url.startsWith(prefix) ? url.slice(prefix.length) : ''
+      const download = key ? savedCoverMedia(next.owner, key) : cacheRemoteMedia(next.owner, url)
+      void download.then(value => {
+        if (!active || !value) return
+        // #ifdef H5
+        if (value instanceof Blob) local.set(url, URL.createObjectURL(value))
+        // #endif
+        if (typeof value === 'string') local.set(url, value)
+      }).catch(() => undefined)
+    }
+  }, { immediate: true })
+  onUnmounted(() => local.forEach(revoke))
+  return (url: string) => local.get(url) || (url.startsWith('book-local-media:') ? '' : url)
+}
+
 /** 已上传媒体的展示地址：优先本机缓存，其次原始地址。 */
 export function rememberMedia(url: string, localPath: string) {
   try {

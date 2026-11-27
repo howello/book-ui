@@ -100,9 +100,9 @@
             <view class="foot-btn" @click="reply(remark)"><AppIcon name="corner" :size="12" /><text>回复</text></view>
             <view class="foot-btn" @click="editRemark(remark)"><AppIcon name="edit" :size="12" /><text>编辑</text></view>
           </view>
-          <view v-if="childrenOf(remark).length" class="remark-tail" @click="openRemark(remark)">
+          <view v-if="remark.childCount" class="remark-tail" @click="openRemark(remark)">
             <AppIcon name="corner" :size="12" />
-            <text>展开 {{ childrenOf(remark).length }} 条子备注</text>
+            <text>展开 {{ remark.childCount }} 条子备注</text>
           </view>
         </view>
         <view v-if="!remarks.length" class="empty">
@@ -153,7 +153,7 @@ import AppImage from '../../components/AppImage.vue'
 import SortMenu from '../../components/SortMenu.vue'
 import AppSheet from '../../components/AppSheet.vue'
 import { ROUTES, goHome } from '../../shared/navigation'
-import { ApiError, fetchNode, fetchNodes, removeNode, useBookStore } from '../../shared/store'
+import { ancestorsOf, fetchNodePage, fetchSubtree, removeNode, useBookStore } from '../../shared/store'
 import type { BookNode, NoteBlock } from '../../shared/types'
 import { blocksOf, parseContent } from '../../shared/types'
 import { pageOption, requireLogin, saveNode } from '../../shared/use-book'
@@ -218,10 +218,6 @@ function bodyOf(node: BookNode) {
 function timeOf(node: BookNode) {
   const time = node.createdAt || node.updatedAt || ''
   return time ? time.slice(5, 16).replace('T', ' ') : ''
-}
-
-function childrenOf(node: BookNode) {
-  return tree.value.filter(item => item.parentId === node.id)
 }
 
 /** 波形高度按块 ID 稳定生成，避免每次渲染跳动。 */
@@ -308,11 +304,16 @@ function newRemarkId() {
 }
 
 /** 导出单条感悟（含正文块与子备注）为 Markdown。 */
-function exportNote() {
+async function exportNote() {
   moreOpen.value = false
-  if (!note.value) return
-  saveMarkdown(`${note.value.title}.md`, noteMarkdown(note.value, book.value, tree.value))
-  toast('已导出为 Markdown')
+  const node = note.value
+  if (!node) return
+  try {
+    saveMarkdown(`${node.title}.md`, noteMarkdown(node, book.value, await fetchSubtree(node.id)))
+    toast('已导出为 Markdown')
+  } catch (failure) {
+    toast(failure instanceof Error ? failure.message : '导出失败')
+  }
 }
 
 function copyNote() {
@@ -361,16 +362,12 @@ async function load() {
   loading.value = true
   hasLoaded = true
   try {
-    const [rows, node] = await Promise.allSettled([fetchNodes({ tree: true }), fetchNode(noteId.value)])
-    if (rows.status === 'fulfilled') tree.value = rows.value
-    if (node.status === 'fulfilled') detail.value = node.value
-    else if (node.reason instanceof ApiError && node.reason.status === 0) {
-      detail.value = tree.value.find(item => item.id === noteId.value && item.contentJson !== undefined)
-      if (!detail.value) throw node.reason
-    } else {
-      detail.value = undefined
-      throw node.reason
+    const apply = (rows: BookNode[]) => {
+      tree.value = rows
+      detail.value = rows.find(node => node.id === noteId.value)
+      loading.value = false
     }
+    apply(await fetchNodePage(noteId.value, apply))
   } catch (failure) {
     error.value = failure instanceof Error ? failure.message : '加载失败'
   } finally {

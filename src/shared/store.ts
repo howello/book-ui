@@ -2,7 +2,9 @@ import { computed, reactive, ref, watch } from 'vue'
 import { bookStoragePrefix, baseApi } from '../api-env'
 import type { BookNode, NodeType } from './types'
 import { parseContent } from './types'
-import { mergePendingNotes, pendingNote, pendingNotes, writePendingNote } from './pending-notes'
+import { clearCacheRecords, listCache, readCache, writeCache, writeCacheBatch } from './cache-db'
+import { clearScopeMedia, rememberScopeMedia } from './scope-media'
+import { pendingNote, pendingNotes, restorePendingNotes, writePendingNote } from './pending-notes'
 
 /** 节点类型显示名。 */
 export const TYPE_NAMES: Record<NodeType, string> = {
@@ -76,8 +78,6 @@ const profile = ref<AccountProfile | null>(token.value && account.value ? uni.ge
 const nodes = ref<BookNode[]>([])
 const loading = ref(false)
 const error = ref('')
-let cacheRevision = 0
-const syncedNotes = new Map<string, { revision: number; node: BookNode }>()
 
 /** 本地缓存键按账号隔离，切换账号不会串数据。 */
 const cachePrefix = (owner: string) => `${bookStoragePrefix}-cache:${owner}:`
@@ -131,186 +131,312 @@ export function request<T>(url: string, method: 'GET' | 'POST' | 'PUT' | 'DELETE
 
 interface NodeListOptions {
   parentId?: string | null
-  tree?: boolean
-  withContent?: boolean
 }
 
-function nodeListPath(params: NodeListOptions) {
-  // 不用 URLSearchParams：Android WebView 的旧内核没有这个全局对象
-  const search: string[] = []
-  if (params.tree) search.push('tree=true')
-  else if (params.parentId) search.push('parentId=' + encodeURIComponent(params.parentId))
-  if (params.withContent !== false) search.push('withContent=true')
-  return '/book/nodes' + (search.length ? '?' + search.join('&') : '')
+interface ScopeDelta {
+  upserts: BookNode[]
+  removed: string[]
+  order: string[]
+  parent?: BookNode | null
 }
 
-/** 立即读取当前账号的本机列表，并叠加尚未上传的感悟。 */
-export function readCachedNodes(params: NodeListOptions = {}): BookNode[] | undefined {
+export const downloadProgress = reactive({ running: 0, completed: 0, total: 0, changed: 0, problem: '', updatedAt: 0 })
+const scopeRequests = new Map<string, Promise<BookNode[]>>()
+const cacheEpoch = new Map<string, number>()
+const clearingOwners = new Set<string>()
+let beforePull: () => Promise<void> = async () => {}
+let wakeUploader: () => void = () => {}
+let lastScope: string | null | undefined
+
+const storagePrefix = (owner: string) => 'download:' + owner + ':'
+const scopeKey = (owner: string, parent?: string | null) => storagePrefix(owner) + 'scope:' + (parent || '')
+const nodeKey = (owner: string, id: string) => storagePrefix(owner) + 'node:' + id
+
+export function registerBeforePull(flush: () => Promise<void>, wake: () => void) {
+  beforePull = flush
+  wakeUploader = wake
+}
+
+export function refreshActiveScope() {
+  if (lastScope !== undefined && token.value) void refreshNodes({ parentId: lastScope }).catch(() => undefined)
+}
+
+async function cached<T>(key: string) {
+  return readCache<T>(key).catch(() => undefined)
+}
+
+async function persist<T>(key: string, value: T | undefined) {
+  await writeCache(key, value).catch(() => undefined)
+}
+
+function visibleScope(owner: string, parent: string | null, rows: BookNode[]) {
+  const merged = new Map(rows.map(node => [node.id, node]))
+  for (const entry of pendingNotes(owner)) {
+    if (entry.operation === 'delete' || (entry.node.parentId || null) !== parent) {
+      merged.delete(entry.node.id)
+    } else {
+      merged.set(entry.node.id, { ...merged.get(entry.node.id), ...entry.node })
+    }
+  }
+  return [...merged.values()].sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id.localeCompare(b.id))
+}
+
+async function readScope(owner: string, parent: string | null) {
+  const rows = await cached<BookNode[]>(scopeKey(owner, parent))
+  if (rows) return rows
+  const old = uni.getStorageSync(cacheKey('/book/nodes?tree=true&withContent=true', owner))
+  return Array.isArray(old) ? (old as BookNode[]).filter(row => (row.parentId || null) === parent) : undefined
+}
+
+/** 仅读取当前父节点下已经缓存的直接子节点。 */
+export async function readCachedNodes({ parentId = null }: NodeListOptions = {}) {
   const owner = account.value
   if (!token.value || !owner) return
-  const cached = uni.getStorageSync(cacheKey(nodeListPath(params), owner))
-  if (Array.isArray(cached)) return mergePendingNotes(owner, cached, params.tree, params.parentId)
-  const local = mergePendingNotes(owner, [], params.tree, params.parentId)
-  if (local.length) return local
+  const rows = await readScope(owner, parentId)
+  if (owner !== account.value || !token.value) return
+  await restorePendingNotes(owner)
+  const visible = visibleScope(owner, parentId, rows || [])
+  return rows || visible.length ? visible : undefined
 }
 
-/** 刷新列表，远程成功后更新本机缓存。 */
-export async function refreshNodes(params: NodeListOptions = {}): Promise<BookNode[]> {
-  const path = nodeListPath(params)
+/** 发送本层已有的指纹，只接收本层变化。 */
+export function refreshNodes({ parentId = null }: NodeListOptions = {}): Promise<BookNode[]> {
   const owner = account.value
-  const key = cacheKey(path, owner)
-  const revision = cacheRevision
-  let value = await request<BookNode[]>(path)
-  if (!Array.isArray(value)) throw new ApiError('列表响应无效', 502)
-  if (revision !== cacheRevision && (params.tree || params.parentId)) {
-    const rows = new Map(value.map(node => [node.id, node]))
-    for (const { revision: savedAt, node } of syncedNotes.values()) {
-      if (savedAt <= revision || (!params.tree && node.parentId !== params.parentId)) continue
-      if ((rows.get(node.id)?.version || 0) >= (node.version || 0)) continue
-      rows.set(node.id, params.withContent === false ? { ...node, contentJson: undefined } : node)
+  const currentToken = token.value
+  if (clearingOwners.has(owner)) return Promise.reject(new ApiError('正在清理本地缓存', 499))
+  const epoch = cacheEpoch.get(owner) || 0
+  const key = scopeKey(owner, parentId)
+  const active = () => owner === account.value && currentToken === token.value && epoch === (cacheEpoch.get(owner) || 0)
+  const queryKey = JSON.stringify([key, currentToken, epoch])
+  lastScope = parentId
+  const existing = scopeRequests.get(queryKey)
+  if (existing) return existing
+  if (!downloadProgress.running) Object.assign(downloadProgress, { completed: 0, total: 0, changed: 0, problem: '' })
+  downloadProgress.running++
+  downloadProgress.total++
+  const task = (async () => {
+    await beforePull()
+    if (!active()) throw new ApiError('当前缓存已变化', 499)
+    const baseline = await readScope(owner, parentId) || []
+    const known: Record<string, string> = {}
+    for (const node of baseline) if (node.cacheVersion) known[node.id] = node.cacheVersion
+    const parent = parentId ? await cachedNode(owner, parentId) : undefined
+    const delta = await request<ScopeDelta>('/book/nodes/scope', 'POST', { parentId, known, parentVersion: parent?.cacheVersion })
+    if (!active()) throw new ApiError('当前缓存已变化', 499)
+    if (!Array.isArray(delta?.order) || !Array.isArray(delta.upserts) || !Array.isArray(delta.removed)) {
+      throw new ApiError('同步响应无效', 502)
     }
-    value = [...rows.values()]
-  }
-  try {
-    uni.setStorageSync(key, value)
-  } catch {
-    // 缓存空间不足不影响在线结果
-  }
-  return mergePendingNotes(owner, value, params.tree, params.parentId)
+    const merged = new Map(baseline.map(row => [row.id, row]))
+    for (const row of delta.upserts) merged.set(row.id, row)
+    const rows = delta.order.map(id => merged.get(id))
+    if (rows.some(row => !row)) throw new ApiError('本层数据不完整，请重试', 502)
+    const ready = rows as BookNode[]
+    await persist(key, ready)
+    const changed = delta.parent ? [...delta.upserts, delta.parent] : delta.upserts
+    await writeCacheBatch(changed.map(row => [nodeKey(owner, row.id), row])).catch(() => undefined)
+    for (const id of delta.removed) {
+      const old = await cached<BookNode>(nodeKey(owner, id))
+      if (old && (old.parentId || null) === parentId) await persist(nodeKey(owner, id), undefined)
+    }
+    if (!active()) throw new ApiError('当前缓存已变化', 499)
+    rememberScopeMedia(owner, delta.parent ? [...ready, delta.parent] : ready)
+    downloadProgress.changed += changed.length + delta.removed.length
+    downloadProgress.completed++
+    downloadProgress.updatedAt = Date.now()
+    return visibleScope(owner, parentId, ready)
+  })().catch(error => {
+    if (active()) downloadProgress.problem = error instanceof Error ? error.message : '更新失败'
+    throw error
+  }).finally(() => {
+    scopeRequests.delete(queryKey)
+    downloadProgress.running--
+  })
+  scopeRequests.set(queryKey, task)
+  return task
 }
 
-/** 读取列表：在线优先，断网时读取当前账号的本机缓存。 */
-export async function fetchNodes(params: NodeListOptions = {}): Promise<BookNode[]> {
-  const owner = account.value
+/** 先回显本层缓存，再异步更新；离线时保留已读的数据。 */
+export async function fetchNodes(params: NodeListOptions = {}, showCached?: (rows: BookNode[]) => void): Promise<BookNode[]> {
+  const local = await readCachedNodes(params)
+  if (local) showCached?.(local)
   try {
     return await refreshNodes(params)
-  } catch (failure) {
-    if (failure instanceof ApiError && failure.status === 0 && token.value && owner === account.value) {
-      const cached = readCachedNodes(params)
-      if (cached !== undefined) return cached
-      throw new ApiError('联网打开后可离线使用', 0)
-    }
-    throw failure
+  } catch (error) {
+    if (local && error instanceof ApiError && (error.status === 0 || error.status >= 500)) return local
+    throw error
   }
 }
 
-/** 读取节点详情：在线优先，断网回落到本机缓存。 */
+async function cachedNode(owner: string, id: string) {
+  const detail = await cached<BookNode>(nodeKey(owner, id))
+  if (detail) return detail
+  const legacy = uni.getStorageSync(cacheKey('/book/nodes/' + id, owner))
+  if (legacy?.id === id) return legacy as BookNode
+  const old = uni.getStorageSync(cacheKey('/book/nodes?tree=true&withContent=true', owner))
+  return Array.isArray(old) ? (old as BookNode[]).find(node => node.id === id) : undefined
+}
+
+/** 详情优先读取未上传修改与本机内容。 */
 export async function fetchNode(id: string): Promise<BookNode> {
-  const path = '/book/nodes/' + id
   const owner = account.value
-  const key = cacheKey(path, owner)
-  const revision = cacheRevision
+  await restorePendingNotes(owner)
   const local = pendingNote(owner, id)
+  if (local?.operation === 'delete') throw new ApiError('节点不存在或已删除', 404)
   if (local) return local.node
+  const value = await cachedNode(owner, id)
+  if (value) return value
+  await beforePull()
+  const remote = await request<BookNode>('/book/nodes/' + id)
+  if (owner === account.value) await persist(nodeKey(owner, id), remote)
+  return remote
+}
+
+/** 只补面包屑中的祖先，优先查已经访问过的节点。 */
+export async function fetchNodePath(id: string): Promise<BookNode[]> {
+  if (!id) return []
+  const owner = account.value
+  await restorePendingNotes(owner)
+  const seen = new Set<string>()
+  const path: BookNode[] = []
+  let cursor: string | null = id
+  while (cursor && !seen.has(cursor)) {
+    seen.add(cursor)
+    const pending = pendingNote(owner, cursor)
+    if (pending?.operation === 'delete') throw new ApiError('节点不存在或已删除', 404)
+    const node: BookNode | undefined = pending?.node || await cachedNode(owner, cursor)
+    if (!node) {
+      await beforePull()
+      const ancestors = await request<BookNode[]>('/book/nodes/' + cursor + '/path')
+      if (owner !== account.value) throw new ApiError('登录账号已变化', 499)
+      for (const row of ancestors) await persist(nodeKey(owner, row.id), row)
+      return [...ancestors, ...path.reverse()]
+    }
+    path.push(node)
+    cursor = node.parentId || null
+  }
+  return path.reverse()
+}
+
+export async function fetchNodePage(id: string, showCached?: (rows: BookNode[]) => void) {
+  const path = await fetchNodePath(id)
+  const owner = account.value
   try {
-    let value = await request<BookNode>(path)
-    const synced = syncedNotes.get(id)
-    if (synced && synced.revision > revision && (synced.node.version || 0) > (value.version || 0)) value = synced.node
-    try {
-      uni.setStorageSync(key, value)
-    } catch {
-      // 缓存空间不足不影响在线结果
-    }
-    return pendingNote(owner, id)?.node ?? value
-  } catch (failure) {
-    if (failure instanceof ApiError && failure.status === 404) uni.removeStorageSync(key)
-    if (failure instanceof ApiError && failure.status === 0 && token.value && owner === account.value) {
-      const cached = uni.getStorageSync(key)
-      if (cached && typeof cached === 'object') return cached as BookNode
-      throw new ApiError('联网打开后可离线使用', 0)
-    }
-    throw failure
+    const rows = await fetchNodes({ parentId: id }, local => showCached?.([...path, ...local]))
+    return [...await fetchNodePath(id), ...rows]
+  } catch (error) {
+    if (path.length && owner === account.value && error instanceof ApiError && error.status === 0) return path
+    throw error
   }
 }
 
-/** 后台同步成功后更新已打开的详情及列表缓存。 */
-export function cacheSyncedNote(owner: string, node: BookNode) {
-  if (owner !== account.value) return
-  syncedNotes.set(node.id, { revision: ++cacheRevision, node })
-  uni.setStorageSync(cacheKey('/book/nodes/' + node.id, owner), node)
-  const prefix = cachePrefix(owner) + '/book/nodes?'
-  for (const key of uni.getStorageInfoSync().keys) {
-    if (!key.startsWith(prefix)) continue
-    const params = key.slice(prefix.length).split('&')
-    const tree = params.includes('tree=true')
-    const parentId = params.find(part => part.startsWith('parentId='))?.slice(9)
-    if (!tree && parentId !== encodeURIComponent(node.parentId || '')) continue
-    const rows = uni.getStorageSync(key)
-    if (!Array.isArray(rows)) continue
-    const saved = params.includes('withContent=true') ? node : { ...node, contentJson: undefined }
-    const index = rows.findIndex((row: BookNode) => row.id === node.id)
-    if (index < 0) rows.push(saved)
-    else rows[index] = saved
-    uni.setStorageSync(key, rows)
+/** 导出由用户触发，逐层读取所选子树。 */
+export async function fetchSubtree(id: string) {
+  const result: BookNode[] = []
+  const pending = [id]
+  const seen = new Set(pending)
+  while (pending.length) {
+    const rows = await fetchNodes({ parentId: pending.pop()! })
+    for (const row of rows) {
+      if (seen.has(row.id)) continue
+      seen.add(row.id)
+      result.push(row)
+      if (row.childCount !== 0) pending.push(row.id)
+    }
+  }
+  return result
+}
+
+export async function cacheSyncedNote(owner: string, node: BookNode) {
+  if (owner !== account.value || clearingOwners.has(owner)) return
+  const old = await cachedNode(owner, node.id)
+  if (clearingOwners.has(owner)) return
+  const refresh = { ...node, childCount: old?.childCount }
+  await persist(nodeKey(owner, node.id), refresh)
+  const destination = node.parentId || null
+  const previous = old?.parentId || null
+  for (const parent of new Set([destination, previous])) {
+    const key = scopeKey(owner, parent)
+    const rows = await cached<BookNode[]>(key)
+    if (!rows) continue
+    const others = rows.filter(row => row.id !== node.id)
+    await persist(key, parent === destination ? [...others, refresh] : others)
   }
 }
 
-/** 删除节点及其后代，同时清除已删除节点的本机数据。 */
+export async function cacheSyncedDeletion(owner: string, ids: string[]) {
+  if (owner !== account.value || clearingOwners.has(owner)) return
+  const deleted = new Set(ids)
+  for (const id of ids) {
+    await persist(nodeKey(owner, id), undefined)
+    await persist(scopeKey(owner, id), undefined)
+  }
+  const scopes = await listCache<BookNode[]>(storagePrefix(owner) + 'scope:').catch(() => [])
+  for (const [key, rows] of scopes) {
+    if (rows.some(row => deleted.has(row.id))) await persist(key, rows.filter(row => !deleted.has(row.id)))
+  }
+}
+
+/** 本机立即隐藏，联网后由上传队列提交删除。 */
 export async function removeNode(id: string): Promise<string[]> {
   const owner = account.value
+  const node = await fetchNode(id)
   const local = pendingNote(owner, id)
-  const ids = local && !local.node.version && !local.attempted
-    ? [id]
-    : await request<string[]>('/book/nodes/' + id, 'DELETE')
-  const deleted = new Set(ids)
-  ids.forEach(id => syncedNotes.delete(id))
-  for (const entry of pendingNotes(owner)) {
-    if (deleted.has(entry.node.id) || deleted.has(entry.node.parentId || '')) {
-      deleted.add(entry.node.id)
-      writePendingNote(owner, entry.node.id)
+  const byParent = groupByParent(pendingNotes(owner).map(entry => entry.node))
+  const ids = [id]
+  const seen = new Set(ids)
+  for (let index = 0; index < ids.length; index++) {
+    for (const child of byParent.get(ids[index]) || []) {
+      if (!seen.has(child.id)) { seen.add(child.id); ids.push(child.id) }
     }
   }
-  const prefix = cachePrefix(owner) + '/book/nodes'
-  for (const key of uni.getStorageInfoSync().keys) {
-    if (!key.startsWith(prefix)) continue
-    const suffix = key.slice(prefix.length)
-    if (suffix.startsWith('/')) {
-      if (deleted.has(suffix.slice(1))) uni.removeStorageSync(key)
-    } else {
-      const cached = uni.getStorageSync(key)
-      if (Array.isArray(cached)) uni.setStorageSync(key, cached.filter(row => !deleted.has(row.id)))
-    }
-  }
-  return [...deleted]
+  for (const child of ids.slice(1)) writePendingNote(owner, child)
+  if (local && !node.version && !local.attempted) writePendingNote(owner, id)
+  else writePendingNote(owner, id, { node, revision: Date.now().toString(36) + ':delete', operation: 'delete' })
+  wakeUploader()
+  return ids
 }
 
-/**
- * 批量补齐节点正文。
- *
- * 列表接口只返回摘要（不含 contentJson），而封面配色、书目信息、
- * 感悟摘要和备注正文都在正文里，因此页面按需并发取详情并回填，
- * 已补齐的节点在本轮会话内不再重复请求。
- */
-const detailCache = new Map<string, BookNode>()
+export async function cachedScopeCount(owner: string) {
+  return (await listCache<BookNode[]>(storagePrefix(owner) + 'scope:').catch(() => [])).length
+}
 
-/** 补齐一组节点的正文，失败时保留原摘要，不阻断页面渲染。 */
-export async function hydrate(nodes: BookNode[], limit = 6): Promise<BookNode[]> {
-  const pending = nodes.filter(node => !node.contentJson && !detailCache.has(node.id))
-  const queue = [...pending]
-  const worker = async () => {
-    while (queue.length) {
-      const node = queue.shift()
-      if (!node) return
-      try {
-        const detail = await fetchNode(node.id)
-        detailCache.set(node.id, detail)
-        node.contentJson = detail.contentJson
-        node.coverKind = detail.coverKind ?? node.coverKind
-        node.coverRef = detail.coverRef ?? node.coverRef
-        node.createdAt = detail.createdAt ?? node.createdAt
-      } catch {
-        // 单个节点读取失败不影响整页
-      }
+export async function clearOfflineCache(owner: string) {
+  if (!owner || clearingOwners.has(owner)) return
+  clearingOwners.add(owner)
+  cacheEpoch.set(owner, (cacheEpoch.get(owner) || 0) + 1)
+  try {
+    await Promise.allSettled([...scopeRequests.values()])
+    await clearCacheRecords(storagePrefix(owner))
+    for (const key of uni.getStorageInfoSync().keys) {
+      if (key.startsWith(cachePrefix(owner))) uni.removeStorageSync(key)
     }
+    await clearScopeMedia(owner)
+    if (owner === account.value) {
+      lastScope = undefined
+      Object.assign(downloadProgress, { completed: 0, total: 0, changed: 0, problem: '', updatedAt: 0 })
+    }
+  } finally {
+    clearingOwners.delete(owner)
   }
-  await Promise.all(Array.from({ length: Math.min(limit, queue.length) }, worker))
-  return nodes
+}
+
+export async function fetchShelfStats(showCached?: (value: ShelfStats) => void) {
+  const key = storagePrefix(account.value) + 'stats'
+  const saved = await cached<ShelfStats>(key)
+  if (saved) showCached?.(saved)
+  try {
+    const fresh = await request<ShelfStats>('/book/nodes/stats')
+    await persist(key, fresh)
+    return fresh
+  } catch (error) {
+    if (saved) return saved
+    throw error
+  }
 }
 
 /** 清除本机会话与内存状态。 */
 export function clearSession() {
-  detailCache.clear()
-  syncedNotes.clear()
+  lastScope = undefined
   token.value = ''
 
   account.value = ''
@@ -371,7 +497,7 @@ export function useBookStore() {
       if (!token.value) return
       loading.value = true
       try {
-        nodes.value = await fetchNodes({ tree: true })
+        nodes.value = await fetchNodes()
       } catch (failure) {
         error.value = failure instanceof Error ? failure.message : '加载失败'
       } finally {
@@ -438,6 +564,18 @@ export function breadcrumbOf(list: BookNode[], id?: string | null): BookNode[] {
   return cursor ? [...ancestorsOf(list, id).reverse(), cursor] : []
 }
 
+/** 分类选择项显示完整路径，便于区分同名子分类。 */
+export function categoryOptions(list: BookNode[]) {
+  const categories = list.filter(node => node.nodeType === 'category')
+  const labels = new Map<string, string>()
+  for (const { node, root } of outlineRows(categories, new Set())) {
+    if (root) continue
+    const parent = node.parentId ? labels.get(node.parentId) : undefined
+    labels.set(node.id, parent ? `${parent} / ${node.title}` : node.title)
+  }
+  return categories.map(node => ({ node, label: labels.get(node.id) || node.title }))
+}
+
 /** 书本下感悟数、感悟下备注数等直接子节点数量。 */
 export function childCount(list: BookNode[], id: string, type?: NodeType): number {
   return list.filter(node => node.parentId === id && (!type || node.nodeType === type)).length
@@ -446,19 +584,22 @@ export function childCount(list: BookNode[], id: string, type?: NodeType): numbe
 /** 子树统计：书本卡片上的感悟条数、感悟卡片上的备注条数等。 */
 export function descendantStats(list: BookNode[], parentId: string) {
   const groups = groupByParent(list)
-  let notes = 0
-  let remarks = 0
-  let books = 0
-  const walk = (id: string) => {
+  const totals = { notes: 0, remarks: 0, books: 0, categories: 0 }
+  const pending = [parentId]
+  const seen = new Set(pending)
+  while (pending.length) {
+    const id = pending.pop()!
     for (const node of groups.get(id) || []) {
-      if (node.nodeType === 'note') notes += 1
-      else if (node.nodeType === 'remark') remarks += 1
-      else if (node.nodeType === 'book') books += 1
-      walk(node.id)
+      if (seen.has(node.id)) continue
+      seen.add(node.id)
+      if (node.nodeType === 'note') totals.notes += 1
+      else if (node.nodeType === 'remark') totals.remarks += 1
+      else if (node.nodeType === 'book') totals.books += 1
+      else if (node.nodeType === 'category') totals.categories += 1
+      pending.push(node.id)
     }
   }
-  walk(parentId)
-  return { notes, remarks, books }
+  return totals
 }
 
 /** 树的扁平化结果：按展开状态输出深度与可见行。 */
@@ -494,16 +635,18 @@ export function outlineRows(list: BookNode[], collapsed: Set<string>): TreeRow[]
   rows.push({ node: rootNode(roots.length), depth: 0, children: roots.length, root: true })
   if (collapsed.has(ROOT_ID)) return rows
   const seen = new Set<string>()
-  const walk = (parent: string, depth: number) => {
-    for (const node of groups.get(parent) || []) {
-      if (seen.has(node.id)) continue
-      seen.add(node.id)
-      const count = (groups.get(node.id) || []).length
-      rows.push({ node, depth, children: count })
-      if (count && !collapsed.has(node.id)) walk(node.id, depth + 1)
+  const pending = [...roots].reverse().map(node => ({ node, depth: 1 }))
+  while (pending.length) {
+    const { node, depth } = pending.pop()!
+    if (seen.has(node.id)) continue
+    seen.add(node.id)
+    const children = groups.get(node.id) || []
+    rows.push({ node, depth, children: node.childCount ?? children.length })
+    if (collapsed.has(node.id)) continue
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      pending.push({ node: children[index], depth: depth + 1 })
     }
   }
-  walk('', 1)
   return rows
 }
 
@@ -547,8 +690,9 @@ export interface MindLayout {
 
 /** 计算思维导图布局；O(n) 一次遍历。 */
 export function mindLayout(list: BookNode[], collapsed: Set<string>): MindLayout {
-  const groups = groupByParent(list)
+  const rows = outlineRows(list, collapsed)
   const nodes: MindNode[] = []
+  const childrenByParent = new Map<string, MindNode[]>()
   const links: MindLink[] = []
   const nodeW = 196
   const colGap = 92
@@ -556,61 +700,49 @@ export function mindLayout(list: BookNode[], collapsed: Set<string>): MindLayout
   const pad = 46
   let cursorY = 0
 
-  const makeNode = (node: BookNode, depth: number, y: number, children: number): MindNode => ({
-    id: node.id,
-    title: node.title,
-    type: node.nodeType,
-    meta: metaOf(node, children),
-    x: depth * (nodeW + colGap),
-    y,
-    w: MIND_SIZE[node.nodeType].w,
-    h: MIND_SIZE[node.nodeType].h,
-    depth,
-    children
-  })
-
-  const build = (node: BookNode, depth: number, parent?: MindNode): MindNode => {
-    const allKids = groups.get(node.id) || []
-    const kids = collapsed.has(node.id) ? [] : allKids
-    if (!kids.length) {
-      const size = MIND_SIZE[node.nodeType]
-      const self = makeNode(node, depth, cursorY, allKids.length)
-      cursorY += size.h + rowGap
-      nodes.push(self)
-      if (parent) links.push({ from: parent, to: self, path: '' })
-      return self
+  const parents = new Set(rows.filter(row => !row.root).map(row => row.node.parentId || ROOT_ID))
+  for (const row of rows) {
+    const type = row.root ? 'root' : row.node.nodeType
+    const size = MIND_SIZE[type]
+    const placed: MindNode = {
+      id: row.node.id,
+      title: row.node.title,
+      type,
+      meta: row.root ? `${row.children} 个分类` : metaOf(row.node, row.children),
+      x: row.depth * (nodeW + colGap),
+      y: cursorY,
+      ...size,
+      depth: row.depth,
+      children: row.children
     }
-    const placed = kids.map(child => build(child, depth + 1))
-    const first = placed[0]
-    const last = placed[placed.length - 1]
-    const height = MIND_SIZE[node.nodeType].h
-    const self = makeNode(node, depth, (first.y + first.h / 2 + last.y + last.h / 2) / 2 - height / 2, kids.length)
-    nodes.push(self)
-    // 父节点先建立，再统一连线，避免重复
-    for (const child of placed) links.push({ from: self, to: child, path: '' })
-    if (parent) links.push({ from: parent, to: self, path: '' })
-    return self
+    nodes.push(placed)
+    if (!row.root) {
+      const parent = row.node.parentId || ROOT_ID
+      const siblings = childrenByParent.get(parent) || []
+      siblings.push(placed)
+      childrenByParent.set(parent, siblings)
+    }
+    if (!parents.has(placed.id) || collapsed.has(placed.id)) cursorY += size.h + rowGap
   }
 
-  const categories = groups.get('') || []
-  const rootId = '__book_shelf__'
-  const children = collapsed.has(rootId) ? [] : categories.map(node => build(node, 1))
-  const first = children[0]
-  const last = children[children.length - 1]
-  const root: MindNode = {
-    id: rootId, title: '我的书架', type: 'root', meta: categories.length + ' 个分类',
-    depth: 0, x: 0, y: first && last ? (first.y + first.h / 2 + last.y + last.h / 2) / 2 - MIND_SIZE.root.h / 2 : 0,
-    ...MIND_SIZE.root, children: categories.length
+  let minY = 0
+  let maxX = 0
+  let maxY = 0
+  for (let index = nodes.length - 1; index >= 0; index -= 1) {
+    const node = nodes[index]
+    const children = childrenByParent.get(node.id)
+    if (children?.length) {
+      const first = children[0]
+      const last = children[children.length - 1]
+      node.y = (first.y + first.h / 2 + last.y + last.h / 2) / 2 - node.h / 2
+      for (const child of children) links.push({ from: node, to: child, path: '' })
+    }
+    minY = Math.min(minY, node.y)
+    maxX = Math.max(maxX, node.x + node.w)
+    maxY = Math.max(maxY, node.y + node.h)
   }
-  nodes.push(root)
-  for (const child of children) links.push({ from: root, to: child, path: '' })
-
-  const minX = Math.min(...nodes.map(node => node.x), 0)
-  const minY = Math.min(...nodes.map(node => node.y), 0)
-  const maxX = Math.max(...nodes.map(node => node.x + node.w), 0)
-  const maxY = Math.max(...nodes.map(node => node.y + node.h), 0)
   for (const node of nodes) {
-    node.x += pad - minX
+    node.x += pad
     node.y += pad - minY
   }
   for (const link of links) {
@@ -619,7 +751,7 @@ export function mindLayout(list: BookNode[], collapsed: Set<string>): MindLayout
   return {
     nodes,
     links,
-    width: maxX - minX + pad * 2,
+    width: maxX + pad * 2,
     height: maxY - minY + pad * 2
   }
 }

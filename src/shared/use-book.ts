@@ -1,3 +1,4 @@
+import { queueNote } from './note-sync'
 import { computed, ref } from 'vue'
 import { onLoad, onShow } from '@dcloudio/uni-app'
 import {
@@ -9,6 +10,7 @@ import {
   descendantStats,
   fetchNode,
   fetchNodes,
+  fetchNodePage,
   request,
   useBookStore
 } from './store'
@@ -49,7 +51,7 @@ export function useBookData() {
   async function loadTree() {
     if (!store.token.value) return
     try {
-      tree.value = await fetchNodes({ tree: true })
+      tree.value = detail.value ? await fetchNodePage(detail.value.id) : await fetchNodes()
     } catch (error) {
       failure.value = error instanceof Error ? error.message : '加载失败'
     }
@@ -132,6 +134,13 @@ export function nextChildType(node?: BookNode | null): NodeType {
 
 /** 保存节点：新建走 POST，编辑走 PUT 并带版本。 */
 export async function saveNode(node: BookNode, content: string | null): Promise<BookNode> {
+  const saved = { ...node, parentId: node.parentId || null, contentJson: content }
+  queueNote(useBookStore().account.value, saved)
+  return saved
+}
+
+/** 上传队列提交节点，使用已有服务端接口。 */
+export async function submitNode(node: BookNode, content: string | null): Promise<BookNode> {
   const payload = {
     id: node.id,
     parentId: node.parentId || null,

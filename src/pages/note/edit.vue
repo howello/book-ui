@@ -112,7 +112,7 @@ import AppIcon from '../../components/AppIcon.vue'
 import AppImage from '../../components/AppImage.vue'
 import { bookStoragePrefix } from '../../api-env'
 import { ROUTES } from '../../shared/navigation'
-import { ApiError, fetchNode, fetchNodes, useBookStore } from '../../shared/store'
+import { fetchNode, fetchNodePath, useBookStore } from '../../shared/store'
 import type { BookNode, NoteBlock } from '../../shared/types'
 import { blocksOf, parseContent, stringifyContent } from '../../shared/types'
 import { newId, pageOption, requireLogin } from '../../shared/use-book'
@@ -402,14 +402,7 @@ async function load() {
   try {
     if (editing.value) {
       revision = pendingNote(account, noteId.value)?.revision
-      try {
-        baseNode = await fetchNode(noteId.value)
-      } catch (failure) {
-        if (!(failure instanceof ApiError) || failure.status !== 0) throw failure
-        const cached = await fetchNodes({ tree: true })
-        baseNode = cached.find(node => node.id === noteId.value && node.contentJson !== undefined)
-        if (!baseNode) throw failure
-      }
+      baseNode = await fetchNode(noteId.value)
       form.title = baseNode.title
       const content = parseContent(baseNode)
       form.chapter = content.chapter || ''
@@ -437,7 +430,7 @@ async function load() {
       }
     }
     ready = account === store.account.value
-    void fetchNodes({ tree: true }).then(rows => { tree.value = rows }).catch(() => undefined)
+    void fetchNodePath(bookId.value).then(rows => { tree.value = rows }).catch(() => undefined)
   } catch (failure) {
     toast(failure instanceof Error ? failure.message : '加载失败')
   } finally {

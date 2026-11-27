@@ -48,9 +48,7 @@
         </view>
         <view class="field">
           <text class="label">父分类</text>
-          <picker :range="parentLabels" :value="parentIndex" @change="onParentChange">
-            <view class="input picker">{{ parentLabels[parentIndex] }}</view>
-          </picker>
+          <CategoryPicker v-model="form.parentId" allow-root :excluded="categoryId" label="父分类" />
           <text class="hint">移动分类时会校验不能移到自己或自己的子分类下</text>
         </view>
         <view class="field">
@@ -65,7 +63,7 @@
         <view class="between">
           <view>
             <text class="row-title">分类内容</text>
-            <text class="tiny">{{ bookCount }} 本书 · {{ noteCount }} 条感悟</text>
+            <text class="tiny">{{ totals.categories }} 个子分类 · {{ totals.books }} 本书 · {{ totals.notes }} 条感悟</text>
           </view>
           <button class="btn xs line" @click="viewCategory">查看</button>
         </view>
@@ -76,12 +74,12 @@
           <AppIcon name="trash" :size="13" />删除分类
         </button>
         <text class="tiny danger-note">
-          {{ bookCount ? `分类下还有 ${bookCount} 本书，需先移走或一并删除` : '删除后无法恢复' }}
+          {{ deleteSummary }}
         </text>
       </view>
     </scroll-view>
 
-    <AppSheet v-model="deleteOpen" :title="`删除「${form.name || '分类'}」？`" :subtitle="bookCount ? `分类下还有 ${bookCount} 本书，会一并删除` : '删除后无法恢复'">
+    <AppSheet v-model="deleteOpen" :title="`删除「${form.name || '分类'}」？`" :subtitle="deleteSummary">
       <view class="sheet-acts">
         <button class="btn line" @click="deleteOpen = false">取消</button>
         <button class="btn backdrop" @click="confirmRemove">确认删除</button>
@@ -100,16 +98,17 @@ import AppPage from '../../components/AppPage.vue'
 import AppToast from '../../components/AppToast.vue'
 import AppIcon from '../../components/AppIcon.vue'
 import AppSheet from '../../components/AppSheet.vue'
+import CategoryPicker from '../../components/CategoryPicker.vue'
 import CoverFace from '../../components/CoverFace.vue'
 import CoverFinder from '../../components/CoverFinder.vue'
-import { baseApi } from '../../api-env'
 import { contentCover, coverPalette, libraryCoverUrl, randomLibraryCover } from '../../shared/covers'
 import { ROUTES, goBack } from '../../shared/navigation'
-import { fetchNodes, removeNode, useBookStore } from '../../shared/store'
+import { fetchNodePage, removeNode, useBookStore } from '../../shared/store'
 import type { BookNode } from '../../shared/types'
 import { parseContent, stringifyContent } from '../../shared/types'
-import { importCover, pageOption, requireLogin, saveNode } from '../../shared/use-book'
+import { pageOption, requireLogin, saveNode } from '../../shared/use-book'
 import { toast } from '../../shared/toast'
+import { keepNoteMedia } from '../../shared/media'
 
 const store = useBookStore()
 const categoryId = ref('')
@@ -136,54 +135,34 @@ const form = reactive({
 /** 随机换一张图库封面（与书本共用图库）。 */
 function shuffleCover() {
   form.libraryRef = randomLibraryCover(form.libraryRef)
+  localCoverKey.value = ''
+  selectedCover.value = ''
 }
 
 const category = computed(() => tree.value.find(node => node.id === categoryId.value))
 const palette = computed(() => coverPalette(form.color))
 const selectedCover = ref('')
+const localCoverKey = ref('')
 const previewImage = computed(() =>
-  libraryCoverUrl(form.libraryRef) ||
-  selectedCover.value ||
-  (form.coverKind === 'public' ? form.coverRef : ''))
+  (localCoverKey.value ? 'book-local-media:' + localCoverKey.value : '') ||
+  selectedCover.value || libraryCoverUrl(form.libraryRef) ||
+  (['public', 'external'].includes(form.coverKind) ? form.coverRef : ''))
 
-const books = computed(() => tree.value.filter(node => node.parentId === categoryId.value && node.nodeType === 'book'))
-const bookCount = computed(() => books.value.length)
-const noteCount = computed(() => {
-  let total = 0
-  for (const book of books.value) total += tree.value.filter(node => node.parentId === book.id && node.nodeType === 'note').length
-  return total
+const totals = computed(() => {
+  const rows = tree.value.filter(node => node.parentId === categoryId.value)
+  const books = rows.filter(node => node.nodeType === 'book')
+  return { books: books.length, categories: rows.length - books.length, notes: books.reduce((count, book) => count + (book.childCount || 0), 0) }
 })
-
-/** 可选父分类：排除自身与自身后代，避免成环。 */
-const parentOptions = computed(() => {
-  const blocked = new Set<string>([categoryId.value])
-  let changed = true
-  while (changed) {
-    changed = false
-    for (const node of tree.value) {
-      if (node.parentId && blocked.has(node.parentId) && !blocked.has(node.id)) {
-        blocked.add(node.id)
-        changed = true
-      }
-    }
-  }
-  return tree.value.filter(node => node.nodeType === 'category' && !blocked.has(node.id))
+const deleteSummary = computed(() => {
+  const { books, categories } = totals.value
+  return books || categories ? `${categories} 个子分类及 ${books} 本书会一并删除` : '删除后无法恢复'
 })
-const parentLabels = computed(() => ['书架根目录（第一层）', ...parentOptions.value.map(node => node.title)])
-const parentIndex = computed(() => {
-  const index = parentOptions.value.findIndex(node => node.id === form.parentId)
-  return index < 0 ? 0 : index + 1
-})
-
-function onParentChange(event: { detail: { value: string | number } }) {
-  const index = Number(event.detail.value)
-  form.parentId = index === 0 ? null : parentOptions.value[index - 1]?.id || null
-}
 
 function applyTheme(pick: { color: string; art: string; name?: string; cover?: string }) {
   form.color = pick.color
   form.art = pick.art
   selectedCover.value = pick.cover || ''
+  if (pick.cover) { localCoverKey.value = ''; form.libraryRef = '' }
   toast('已套用配图 · ' + (pick.name || pick.color))
 }
 
@@ -197,38 +176,16 @@ function pickCover() {
       if (!path) return
       uploading.value = true
       try {
-        const url = await upload(path)
+        localCoverKey.value = await keepNoteMedia(store.account.value, path)
         selectedCover.value = ''
-        form.coverKind = 'public'
-        form.coverRef = url
-        toast('封面已上传，保存后生效')
+        form.libraryRef = ''
+        toast('已保存图片，联网后同步')
       } catch (failure) {
         toast(failure instanceof Error ? failure.message : '封面上传失败')
       } finally {
         uploading.value = false
       }
     }
-  })
-}
-
-function upload(path: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    uni.uploadFile({
-      url: baseApi() + '/common/upload',
-      filePath: path,
-      name: 'file',
-      header: { Authorization: 'Bearer ' + store.token.value },
-      success: response => {
-        try {
-          const body = JSON.parse(response.data) as { code?: number; url?: string; msg?: string }
-          if (response.statusCode === 200 && body.code === 200 && body.url) resolve(body.url)
-          else reject(new Error(body.msg || '上传失败'))
-        } catch {
-          reject(new Error('上传失败'))
-        }
-      },
-      fail: () => reject(new Error('上传失败'))
-    })
   })
 }
 
@@ -249,14 +206,16 @@ async function submit() {
       color: form.color,
       art: form.art
     }
-    const cover = selectedCover.value ? await importCover(selectedCover.value) : ''
+    const pendingCover = localCoverKey.value ? { localKey: localCoverKey.value }
+      : selectedCover.value ? { remoteUrl: selectedCover.value } : undefined
     await saveNode({
       ...node,
       title: name,
       parentId: form.parentId,
       sortOrder: Number(form.sortOrder) || 0,
-      coverKind: cover ? 'public' : form.coverKind || 'theme',
-      coverRef: cover || form.coverRef || null
+      coverKind: form.libraryRef ? 'local' : form.coverKind || 'theme',
+      coverRef: form.libraryRef || form.coverRef || null,
+      pendingCover
     }, stringifyContent(next))
     toast('已保存分类信息')
     goBack()
@@ -287,7 +246,7 @@ async function load() {
   loading.value = true
   hasLoaded = true
   try {
-    tree.value = await fetchNodes({ tree: true })
+    tree.value = await fetchNodePage(categoryId.value)
     const node = category.value
     if (!node) { toast('分类不存在或已删除'); return }
     const content = parseContent(node)
@@ -300,6 +259,8 @@ async function load() {
     form.parentId = node.parentId || null
     form.coverKind = node.coverKind || ''
     form.coverRef = node.coverRef || ''
+    selectedCover.value = node.pendingCover?.remoteUrl || ''
+    localCoverKey.value = node.pendingCover?.localKey || ''
     form.libraryRef = node.coverKind === 'local' ? node.coverRef || '' : ''
   } catch (failure) {
     toast(failure instanceof Error ? failure.message : '加载失败')

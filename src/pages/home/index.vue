@@ -49,7 +49,7 @@
                   <view class="cat-face" :class="{ 'on-image': !!coverImage(item.node!) }">
                     <text class="cat-name" :style="coverImage(item.node!) ? {} : { color: paletteOf(item.node!).ink }">{{ item.node!.title }}</text>
                     <text class="cat-count" :style="coverImage(item.node!) ? {} : { color: paletteOf(item.node!).ink }">
-                      {{ countsOf(item.node!).books }} 本 · {{ describe(item.node!) }}
+                      {{ countsOf(item.node!).children }} 项 · {{ describe(item.node!) }}
                     </text>
                   </view>
                 </view>
@@ -68,7 +68,7 @@
       <button class="btn line sheet-btn" @click="editCategory">
         <AppIcon name="edit" :size="13" />编辑分类
       </button>
-      <button class="btn line sheet-btn" @click="menuToast('新建子分类：分类可继续嵌套')">
+      <button class="btn line sheet-btn" @click="openSubcategoryForm">
         <AppIcon name="layers" :size="13" />新建子分类
       </button>
       <button class="btn line sheet-btn danger" @click="removeCategory">
@@ -95,7 +95,7 @@ import CoverFinder from '../../components/CoverFinder.vue'
 import { COVERS, COVER_KEYS, contentCover, coverImage, coverPalette, joinCoverRef } from '../../shared/covers'
 import { bookStoragePrefix } from '../../api-env'
 import { ROUTES } from '../../shared/navigation'
-import { childCount, hydrate, readCachedNodes, refreshNodes, removeNode, shelfStats, useBookStore } from '../../shared/store'
+import { fetchShelfStats, readCachedNodes, refreshNodes, removeNode, useBookStore } from '../../shared/store'
 import type { BookNode } from '../../shared/types'
 import { parseContent, stringifyContent } from '../../shared/types'
 import { saveNode } from '../../shared/use-book'
@@ -137,7 +137,7 @@ function setSort(index: number) {
 
 /** 分类下书本数量（排序用）。 */
 function bookCountOf(node: BookNode) {
-  return tree.value.filter(item => item.parentId === node.id && item.nodeType === 'book').length
+  return node.childCount || 0
 }
 
 /**
@@ -148,7 +148,7 @@ function bookCountOf(node: BookNode) {
  * - 按名称：中文拼音序
  */
 const categories = computed(() => {
-  const list = tree.value.filter(node => node.nodeType === 'category')
+  const list = tree.value.filter(node => node.nodeType === 'category' && !node.parentId)
   return [...list].sort((a, b) => {
     if (sortIndex.value === 1) {
       return bookCountOf(b) - bookCountOf(a) || a.title.localeCompare(b.title, 'zh')
@@ -164,7 +164,7 @@ const categories = computed(() => {
 })
 
 /** 顶部统计：N 个分类 · M 本书 · 本周记了 K 条。 */
-const stats = computed(() => shelfStats(tree.value))
+const stats = ref({ categories: 0, books: 0, notes: 0, weekNotes: 0 })
 const statsText = computed(() => `${stats.value.categories} 个分类 · ${stats.value.books} 本书 · 本周记了 ${stats.value.weekNotes} 条`)
 
 /** 书架卡片：分类 + 末尾「新建」虚线卡。 */
@@ -178,10 +178,7 @@ const shelfRows = computed(() => chunk(shelfCards.value, perRow.value))
 
 /** 分组（分类）下书本计数与感悟计数。 */
 function countsOf(node: BookNode) {
-  const books = tree.value.filter(item => item.parentId === node.id && item.nodeType === 'book')
-  let notes = 0
-  for (const book of books) notes += childCount(tree.value, book.id, 'note')
-  return { books: books.length, notes }
+  return { children: node.childCount || 0 }
 }
 
 /** 分类卡第二行：说明优先，没有说明时显示感悟数。 */
@@ -189,7 +186,7 @@ function describe(node: BookNode) {
   const desc = parseContent(node).desc
   if (desc) return desc
   const counts = countsOf(node)
-  return `${counts.notes} 条感悟`
+  return `${counts.children} 项内容`
 }
 
 function paletteOf(node: BookNode) {
@@ -201,9 +198,10 @@ function toast(message: string) {
   showToast(message)
 }
 
-function menuToast(message: string) {
+function openSubcategoryForm() {
+  const node = menuNode.value
   menuOpen.value = false
-  toast(message)
+  if (node) uni.navigateTo({ url: `${ROUTES.create}?kind=category&parentId=${node.id}` })
 }
 
 function openCategory(node: BookNode) {
@@ -235,7 +233,7 @@ async function removeCategory() {
   const confirmed = await new Promise<boolean>(resolve => {
     uni.showModal({
       title: `删除「${node.title}」？`,
-      content: counts.books ? `分类下还有 ${counts.books} 本书，会一并删除` : '删除后无法恢复',
+      content: counts.children ? '此分类内的所有子分类、书籍和感悟会一并删除' : '删除后无法恢复',
       confirmText: '确认删除',
       success: result => resolve(result.confirm),
       fail: () => resolve(false)
@@ -265,7 +263,8 @@ async function refreshShelf() {
   const owner = store.account.value
   if (!token) return
   const currentSession = () => token === store.token.value && owner === store.account.value
-  const cached = readCachedNodes({ tree: true })
+  const cached = await readCachedNodes()
+  if (!currentSession()) return
   if (cached !== undefined) {
     tree.value = cached
     loadedFor = owner
@@ -275,11 +274,13 @@ async function refreshShelf() {
   loading.value = loadedFor !== owner
   error.value = ''
   try {
-    const fresh = await refreshNodes({ tree: true })
+    const fresh = await refreshNodes()
     if (currentSession()) {
       tree.value = fresh
       loadedFor = owner
-      void hydrate(tree.value.filter(node => node.nodeType === 'category'))
+      void fetchShelfStats(value => { if (currentSession()) stats.value = value }).then(value => {
+        if (currentSession()) stats.value = value
+      }).catch(() => undefined)
     }
   } catch (failure) {
     if (currentSession() && loadedFor !== owner) {
