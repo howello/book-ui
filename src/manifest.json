@@ -1,8 +1,8 @@
 {
     "name" : "悟",
     "appid" : "__UNI__A20E975",
-    "versionName" : "1.0.5",
-    "versionCode" : "105",
+    "versionName" : "1.0.6",
+    "versionCode" : "106",
     "app-plus" : {
         "darkmode" : true,
         "themeLocation" : "theme.json",
